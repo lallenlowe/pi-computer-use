@@ -174,6 +174,21 @@ final class Bridge {
 	private let refStore = AXRefStore()
 	private let inputSuppressionGuard = InputSuppressionGuard()
 	private var stdinBuffer = Data()
+	private var axEnhancedEnabledPids = Set<Int32>()
+
+	/// Force-populates an app's AX tree by setting `AXEnhancedUserInterface` and
+	/// `AXManualAccessibility` on its application element. Many apps — Electron,
+	/// Catalyst, web-heavy hybrids — only expose their full AX tree when an
+	/// assistive client requests it. Mirrors what VoiceOver and OpenAI's Sky
+	/// helper do. Idempotent per process lifetime.
+	private func ensureEnhancedAccessibility(pid: Int32) {
+		if axEnhancedEnabledPids.contains(pid) { return }
+		axEnhancedEnabledPids.insert(pid)
+		let appElement = AXUIElementCreateApplication(pid)
+		AXUIElementSetMessagingTimeout(appElement, 1.0)
+		_ = AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+		_ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+	}
 
 	func run() {
 		while true {
@@ -486,6 +501,7 @@ final class Bridge {
 		guard let app = NSWorkspace.shared.frontmostApplication else {
 			throw BridgeFailure(message: "No frontmost app available", code: "frontmost_unavailable")
 		}
+		ensureEnhancedAccessibility(pid: app.processIdentifier)
 		let pid = app.processIdentifier
 		let appElement = AXUIElementCreateApplication(pid)
 		let focusedWindow = copyAttribute(appElement, attribute: kAXFocusedWindowAttribute as CFString).flatMap(asAXElement)
@@ -632,6 +648,7 @@ final class Bridge {
 	}
 
 	private func listWindows(pid: Int32) throws -> [[String: Any]] {
+		ensureEnhancedAccessibility(pid: pid)
 		let appElement = AXUIElementCreateApplication(pid)
 		AXUIElementSetMessagingTimeout(appElement, 1.0)
 		let windows = axElementArray(appElement, attribute: kAXWindowsAttribute as CFString)
@@ -844,6 +861,7 @@ final class Bridge {
 
 	private func axListTargets(_ request: [String: Any]) throws -> [String: Any] {
 		let pid = Int32(try intArg(request, "pid"))
+		ensureEnhancedAccessibility(pid: pid)
 		let windowId = optionalIntArg(request, "windowId").map { UInt32($0) }
 		let windowRef = optionalStringArg(request, "windowRef")
 		let limit = max(1, min(50, optionalIntArg(request, "limit") ?? 12))
