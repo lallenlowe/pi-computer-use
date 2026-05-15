@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -145,4 +145,47 @@ export function isBrowserUseEnabled(): boolean {
 
 export function getAppleScriptConfig(): AppleScriptConfig {
 	return activeConfig.apple_script;
+}
+
+/**
+ * Path to the user-scoped config file. The interactive `/computer-use`
+ * command writes here; project-scoped overrides at `<cwd>/.pi/computer-use.json`
+ * are intentionally left for hand-editing.
+ */
+export function getUserConfigPath(): string {
+	return path.join(getAgentDir(), "extensions", "pi-computer-use.json");
+}
+
+/**
+ * Persist a partial config update to the user-scoped JSON file. Merges with
+ * any existing values in the file rather than overwriting unrelated keys.
+ * Returns the path that was written.
+ */
+export function saveUserComputerUseConfig(update: Partial<ComputerUseConfig>): string {
+	const targetPath = getUserConfigPath();
+	mkdirSync(path.dirname(targetPath), { recursive: true });
+	let existing: any = {};
+	if (existsSync(targetPath)) {
+		try {
+			existing = JSON.parse(readFileSync(targetPath, "utf-8"));
+			if (typeof existing !== "object" || existing === null) existing = {};
+		} catch {
+			existing = {};
+		}
+	}
+	// Honour the same nested-namespace convention loadComputerUseConfig accepts:
+	// allow either a top-level `computer_use: {...}` wrapper or flat keys. We
+	// always write the flat shape so the file is easy to hand-edit.
+	const flatExisting = existing.computer_use && typeof existing.computer_use === "object" ? existing.computer_use : existing;
+	const merged: any = { ...flatExisting };
+	if (update.browser_use !== undefined) merged.browser_use = update.browser_use;
+	if (update.stealth_mode !== undefined) merged.stealth_mode = update.stealth_mode;
+	if (update.apple_script !== undefined) {
+		merged.apple_script = {
+			...(typeof flatExisting.apple_script === "object" && flatExisting.apple_script !== null ? flatExisting.apple_script : {}),
+			...update.apple_script,
+		};
+	}
+	writeFileSync(targetPath, JSON.stringify(merged, null, 2) + "\n", "utf-8");
+	return targetPath;
 }

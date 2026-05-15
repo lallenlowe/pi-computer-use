@@ -1,4 +1,5 @@
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, type SettingItem, SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	ensureComputerUseSetup,
@@ -21,7 +22,12 @@ import {
 	reconstructStateFromBranch,
 	stopBridge,
 } from "../src/bridge.ts";
-import { getLoadedComputerUseConfig, loadComputerUseConfig } from "../src/config.ts";
+import {
+	getLoadedComputerUseConfig,
+	getUserConfigPath,
+	loadComputerUseConfig,
+	saveUserComputerUseConfig,
+} from "../src/config.ts";
 
 const windowSelectorSchema = Type.Optional(Type.Union([
 	Type.String({ description: "Optional window ref from list_windows, e.g. @w1" }),
@@ -488,6 +494,164 @@ const computerActionsTool = defineTool({
 	},
 });
 
+const TIMEOUT_CHOICES: string[] = ["1000", "2000", "5000", "10000", "30000", "60000"];
+
+function snapToTimeoutChoice(ms: number): string {
+	// Pick the closest available choice; SettingsList is value-list-based, not
+	// a free-form numeric input, so we map the configured value into the menu.
+	let best = TIMEOUT_CHOICES[0];
+	let bestDelta = Number.POSITIVE_INFINITY;
+	for (const choice of TIMEOUT_CHOICES) {
+		const delta = Math.abs(parseInt(choice, 10) - ms);
+		if (delta < bestDelta) {
+			bestDelta = delta;
+			best = choice;
+		}
+	}
+	return best;
+}
+
+function onOff(value: boolean): string {
+	return value ? "on" : "off";
+}
+
+async function openSettingsTUI(ctx: { ui: any; cwd: string }): Promise<void> {
+	const loaded = getLoadedComputerUseConfig();
+	const current = loaded.config;
+
+	const items: SettingItem[] = [
+		{
+			id: "browser_use",
+			label: "browser_use (allow controlling browser apps)",
+			currentValue: onOff(current.browser_use),
+			values: ["on", "off"],
+		},
+		{
+			id: "stealth_mode",
+			label: "stealth_mode (don't steal foreground or warp cursor)",
+			currentValue: onOff(current.stealth_mode),
+			values: ["on", "off"],
+		},
+		{
+			id: "apple_script.enabled",
+			label: "apple_script.enabled (allow apple_script tool)",
+			currentValue: onOff(current.apple_script.enabled),
+			values: ["on", "off"],
+		},
+		{
+			id: "apple_script.restore_frontmost_on_drift",
+			label: "apple_script.restore_frontmost_on_drift",
+			currentValue: onOff(current.apple_script.restore_frontmost_on_drift),
+			values: ["on", "off"],
+		},
+		{
+			id: "apple_script.timeout_ms",
+			label: "apple_script.timeout_ms",
+			currentValue: snapToTimeoutChoice(current.apple_script.timeout_ms),
+			values: TIMEOUT_CHOICES.slice(),
+		},
+	];
+
+	await ctx.ui.custom((tui: any, theme: any, _kb: any, done: (value: undefined) => void) => {
+		const container = new Container();
+		const configPath = getUserConfigPath();
+		container.addChild(
+			new (class {
+				render(width: number) {
+					const title = theme.fg("accent", theme.bold("pi-computer-use settings"));
+					const help = theme.fg(
+						"muted",
+						"\u2191/\u2193 navigate, \u2190/\u2192 toggle, esc to close",
+					);
+					const pathLine = theme.fg("muted", `writes \u2192 ${configPath}`);
+					return [
+						truncateToWidth(title, width),
+						truncateToWidth(help, width),
+						truncateToWidth(pathLine, width),
+						"",
+					];
+				}
+				invalidate() {}
+			})(),
+		);
+
+		const settingsList = new SettingsList(
+			items,
+			Math.min(items.length + 4, 15),
+			getSettingsListTheme(),
+			(id: string, newValue: string) => {
+				try {
+					applySettingChange(ctx, id, newValue);
+					ctx.ui.notify(`computer-use: ${id} = ${newValue}`, "info");
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					ctx.ui.notify(`computer-use: failed to update ${id} \u2014 ${message}`, "warning");
+				}
+			},
+			() => done(undefined),
+		);
+		container.addChild(settingsList);
+
+		return {
+			render(width: number) {
+				return container.render(width);
+			},
+			invalidate() {
+				container.invalidate();
+			},
+			handleInput(data: string) {
+				settingsList.handleInput?.(data);
+				tui.requestRender?.();
+			},
+		};
+	});
+}
+
+function applySettingChange(ctx: { cwd: string }, id: string, newValue: string): void {
+	const boolValue = newValue === "on";
+	switch (id) {
+		case "browser_use":
+			saveUserComputerUseConfig({ browser_use: boolValue });
+			break;
+		case "stealth_mode":
+			saveUserComputerUseConfig({ stealth_mode: boolValue });
+			break;
+		case "apple_script.enabled":
+			saveUserComputerUseConfig({
+				apple_script: {
+					...getLoadedComputerUseConfig().config.apple_script,
+					enabled: boolValue,
+				},
+			});
+			break;
+		case "apple_script.restore_frontmost_on_drift":
+			saveUserComputerUseConfig({
+				apple_script: {
+					...getLoadedComputerUseConfig().config.apple_script,
+					restore_frontmost_on_drift: boolValue,
+				},
+			});
+			break;
+		case "apple_script.timeout_ms": {
+			const ms = parseInt(newValue, 10);
+			if (!Number.isFinite(ms) || ms <= 0) {
+				throw new Error(`invalid timeout '${newValue}'`);
+			}
+			saveUserComputerUseConfig({
+				apple_script: {
+					...getLoadedComputerUseConfig().config.apple_script,
+					timeout_ms: ms,
+				},
+			});
+			break;
+		}
+		default:
+			throw new Error(`unknown setting '${id}'`);
+	}
+	// Reload so any subsequent in-process reads see the new values immediately.
+	loadComputerUseConfig(ctx.cwd);
+}
+
 function formatConfigStatus(): string {
 	const loaded = getLoadedComputerUseConfig();
 	const lines = [
@@ -543,10 +707,19 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("computer-use", {
-		description: "Show pi-computer-use configuration",
-		handler: async (_args, ctx) => {
+		description: "Toggle pi-computer-use settings (or pass 'status' to print a summary)",
+		handler: async (args, ctx) => {
 			loadComputerUseConfig(ctx.cwd);
-			ctx.ui.notify(formatConfigStatus(), "info");
+			const sub = args.trim().split(/\s+/)[0]?.toLowerCase();
+			if (sub === "status") {
+				ctx.ui.notify(formatConfigStatus(), "info");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify(formatConfigStatus(), "info");
+				return;
+			}
+			await openSettingsTUI(ctx);
 		},
 	});
 
