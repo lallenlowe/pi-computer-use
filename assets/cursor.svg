@@ -1,44 +1,36 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" width="600" height="600">
 	<defs>
-		<linearGradient id="cursorFill" x1="10%" y1="0%" x2="90%" y2="100%">
-			<stop offset="0%" stop-color="#FFE39C"/>
-			<stop offset="30%" stop-color="#FF8C42"/>
-			<stop offset="65%" stop-color="#E94F8B"/>
-			<stop offset="100%" stop-color="#7B2D9F"/>
+		<linearGradient id="g" x1="80" y1="180" x2="500" y2="290" gradientUnits="userSpaceOnUse">
+			<stop offset="0%" stop-color="#3FB5FB"/>
+			<stop offset="55%" stop-color="#9C6FF4"/>
+			<stop offset="100%" stop-color="#E92EE8"/>
 		</linearGradient>
-		<filter id="cursorShadow" x="-30%" y="-30%" width="160%" height="160%">
-			<feDropShadow dx="0" dy="1" stdDeviation="0.9" flood-color="#000" flood-opacity="0.4"/>
-		</filter>
 	</defs>
 	<!--
-		Paper-airplane cursor matching the reference. Three rounded
-		corners and asymmetric edges that produce the airplane look:
-		  V0 (4, 4)        top-left tip       (small round)
-		  V1 (28, 16)      far-right shoulder (large round)
-		  V2 (15, 28)      bottom tail        (large round)
-		Edges:
-		  V0 \u2192 V1   convex (bulges up/right) \u2014 leading edge
-		  V1 \u2192 V2   deeply concave (sweeps in toward centroid) \u2014
-		             this is the airplane fold/notch
-		  V2 \u2192 V0   nearly straight, very gently concave \u2014
-		             trailing fuselage edge
+		Paper-airplane cursor with the proper concave notch. Vertex
+		tour, starting at the click hotspot:
+		  P0 (122.5, 101.0)  top-left tip - cursor anchor
+		  P1 (440.6, 255.9)  far-right wingtip (rounded)
+		  P2 (288.9, 331.4)  inner notch on the bottom edge (concave V)
+		  P3 (224.8, 525.4)  bottom tail (rounded)
+		  back to P0         along the trailing fuselage edge
+		Each rounded corner uses a quadratic Bezier with the control
+		point pulled outward beyond the corner so the round "bulges"
+		into the corner.
 	-->
 	<path
+		fill="url(#g)"
 		d="
-		   M 5.0 5.0
-		   Q 18 9, 25.4 14.8
-		   Q 28 16, 25.6 17.4
-		   Q 18 19, 16.5 24.4
-		   Q 15 28, 13.4 24.4
-		   Q 10 16, 4.6 5.4
-		   Q 4 4, 5.0 5.0
+		   M 122.5 101.0
+		   L 440.6 255.9
+		   Q 490 280 436.7 293.6
+		   L 288.9 331.4
+		   Q 255 340 249.4 374.5
+		   L 224.8 525.4
+		   Q 220 555 212.5 526.0
+		   L 106.3 114.2
+		   Q 100 90 122.5 101.0
 		   Z
 		"
-		fill="url(#cursorFill)"
-		stroke="white"
-		stroke-width="1.4"
-		stroke-linejoin="round"
-		stroke-linecap="round"
-		filter="url(#cursorShadow)"
 	/>
 </svg>

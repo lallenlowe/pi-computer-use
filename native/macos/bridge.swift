@@ -176,13 +176,21 @@ final class InputSuppressionGuard {
 /// the visual after the wiring is proven.
 /// Custom NSView that paints the agent's virtual cursor at the
 /// configured screen-local point. Renders a paper-airplane shape
-/// translated from `assets/cursor.svg` (32x32 viewBox) into native
+/// translated from `assets/cursor.svg` (600x600 viewBox) into native
 /// NSBezierPath calls so we don't have to ship a sidecar asset and
-/// the shape scales crisply at any cursorSize. The (4, 4) point in
-/// SVG coordinates is the cursor anchor (the click hotspot).
+/// the shape scales crisply at any cursorSize. SVG (122.5, 101) is
+/// the click hotspot anchor.
 final class OverlayCursorView: NSView {
 	var cursorPoint: CGPoint? = nil
 	var cursorSize: CGFloat = 28
+
+	// SVG viewBox dims and the in-viewBox coords of the click hotspot.
+	// Kept as named constants so the path-translation math reads
+	// cleanly and survives future shape edits without arithmetic
+	// drift between the path data and the anchor positioning.
+	private static let svgViewBoxSize: CGFloat = 600.0
+	private static let svgAnchorX: CGFloat = 122.5
+	private static let svgAnchorY: CGFloat = 101.0
 
 	override var isFlipped: Bool { false }
 
@@ -190,56 +198,60 @@ final class OverlayCursorView: NSView {
 		guard let point = cursorPoint else { return }
 		guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-		// SVG viewBox is 32x32 with the tip at (4, 4). We want to render
-		// the icon so its tip lands at `point`. Scale = cursorSize / 32.
-		let scale = cursorSize / 32.0
+		// scale = cursorSize / svgViewBoxSize so the rendered icon is
+		// `cursorSize` points wide along its viewBox dimension.
+		let scale = cursorSize / OverlayCursorView.svgViewBoxSize
 		let path = OverlayCursorView.makeCursorPath(scale: scale)
 
-		// Translate so SVG (4, 4) lands at `point`. Because AppKit's
-		// view coords are bottom-left origin and our path was authored
-		// in top-left-origin SVG space, we flip the y inside
-		// makeCursorPath so we can translate purely additively here.
+		// Translate so the SVG anchor lands at `point`. The path is
+		// authored y-flipped inside makeCursorPath (SVG top-down ->
+		// AppKit bottom-up), so the SVG y of the anchor maps to the
+		// (svgViewBoxSize - svgAnchorY) offset in view coords.
 		ctx.saveGState()
-		ctx.translateBy(x: point.x - 4 * scale, y: point.y - (32 - 4) * scale)
+		ctx.translateBy(
+			x: point.x - OverlayCursorView.svgAnchorX * scale,
+			y: point.y - (OverlayCursorView.svgViewBoxSize - OverlayCursorView.svgAnchorY) * scale
+		)
 
 		// Soft drop shadow under the whole shape.
 		ctx.saveGState()
-		ctx.setShadow(offset: CGSize(width: 0, height: -1 * scale), blur: 1.0 * scale, color: NSColor.black.withAlphaComponent(0.4).cgColor)
+		ctx.setShadow(
+			offset: CGSize(width: 0, height: -1.0 * scale * 8),
+			blur: scale * 12,
+			color: NSColor.black.withAlphaComponent(0.35).cgColor
+		)
 
-		// Fill via a 4-stop linear gradient running roughly along the
-		// diagonal of travel: warm yellow at the tip transitioning
-		// through orange and pink to a deep purple at the tail.
+		// Fill with the SVG's 3-stop gradient (sky blue -> purple ->
+		// magenta). Gradient direction in SVG userSpaceOnUse coords is
+		// from (80, 180) to (500, 290). We map those into our scaled +
+		// y-flipped coordinate space inline.
 		let gradient = CGGradient(
 			colorsSpace: CGColorSpaceCreateDeviceRGB(),
 			colors: [
-				NSColor(calibratedRed: 1.0, green: 0.89, blue: 0.61, alpha: 1.0).cgColor,
-				NSColor(calibratedRed: 1.0, green: 0.55, blue: 0.26, alpha: 1.0).cgColor,
-				NSColor(calibratedRed: 0.91, green: 0.31, blue: 0.55, alpha: 1.0).cgColor,
-				NSColor(calibratedRed: 0.48, green: 0.18, blue: 0.62, alpha: 1.0).cgColor,
+				NSColor(calibratedRed: 0.247, green: 0.710, blue: 0.984, alpha: 1.0).cgColor,
+				NSColor(calibratedRed: 0.612, green: 0.435, blue: 0.957, alpha: 1.0).cgColor,
+				NSColor(calibratedRed: 0.914, green: 0.180, blue: 0.910, alpha: 1.0).cgColor,
 			] as CFArray,
-			locations: [0.0, 0.30, 0.65, 1.0]
+			locations: [0.0, 0.55, 1.0]
 		)
 		if let gradient = gradient {
 			ctx.saveGState()
 			ctx.addPath(path.compatibleCGPath)
 			ctx.clip()
-			let bounds = path.bounds
+			let startSVG = NSPoint(x: 80, y: 180)
+			let endSVG = NSPoint(x: 500, y: 290)
+			func s(_ p: NSPoint) -> CGPoint {
+				return CGPoint(x: p.x * scale, y: (OverlayCursorView.svgViewBoxSize - p.y) * scale)
+			}
 			ctx.drawLinearGradient(
 				gradient,
-				start: CGPoint(x: bounds.minX + bounds.width * 0.1, y: bounds.maxY),
-				end: CGPoint(x: bounds.minX + bounds.width * 0.9, y: bounds.minY),
+				start: s(startSVG),
+				end: s(endSVG),
 				options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
 			)
 			ctx.restoreGState()
 		}
 		ctx.restoreGState()
-
-		// White outline on top of the gradient fill.
-		NSColor.white.setStroke()
-		path.lineWidth = 1.4 * scale
-		path.lineJoinStyle = .round
-		path.lineCapStyle = .round
-		path.stroke()
 
 		ctx.restoreGState()
 	}
@@ -247,16 +259,15 @@ final class OverlayCursorView: NSView {
 	/// Build the cursor outline as an NSBezierPath at the given scale.
 	/// Path commands are the SVG `d` attribute from assets/cursor.svg,
 	/// translated to NSBezierPath calls. SVG y is top-down; we y-flip
-	/// here (y' = 32 - y) so the resulting path is in standard AppKit
-	/// coords (bottom-up) ready to translate into the view.
+	/// here so the resulting path is in standard AppKit (bottom-up)
+	/// coords ready to translate into the view.
 	private static func makeCursorPath(scale: CGFloat) -> NSBezierPath {
 		func s(_ x: CGFloat, _ y: CGFloat) -> NSPoint {
-			return NSPoint(x: x * scale, y: (32 - y) * scale)
+			return NSPoint(x: x * scale, y: (svgViewBoxSize - y) * scale)
 		}
-		// Convert an SVG quadratic Bezier to NSBezierPath's cubic form.
-		// For Q with control C from start S to end E, the equivalent
-		// cubic has control points (S + 2/3 * (C - S)) and
-		// (E + 2/3 * (C - E)).
+		// Convert an SVG quadratic Bezier (one control point) to
+		// NSBezierPath's cubic form via the standard 2/3 control-point
+		// formula: c1 = S + 2/3*(C - S); c2 = E + 2/3*(C - E).
 		func q(_ path: NSBezierPath, control cx: CGFloat, _ cy: CGFloat, end ex: CGFloat, _ ey: CGFloat) {
 			let S = path.currentPoint
 			let C = s(cx, cy)
@@ -266,13 +277,15 @@ final class OverlayCursorView: NSView {
 			path.curve(to: E, controlPoint1: c1, controlPoint2: c2)
 		}
 		let path = NSBezierPath()
-		path.move(to: s(5.0, 5.0))
-		q(path, control: 18, 9, end: 25.4, 14.8)
-		q(path, control: 28, 16, end: 25.6, 17.4)
-		q(path, control: 18, 19, end: 16.5, 24.4)
-		q(path, control: 15, 28, end: 13.4, 24.4)
-		q(path, control: 10, 16, end: 4.6, 5.4)
-		q(path, control: 4, 4, end: 5.0, 5.0)
+		path.move(to: s(122.5, 101.0))
+		path.line(to: s(440.6, 255.9))
+		q(path, control: 490, 280, end: 436.7, 293.6)
+		path.line(to: s(288.9, 331.4))
+		q(path, control: 255, 340, end: 249.4, 374.5)
+		path.line(to: s(224.8, 525.4))
+		q(path, control: 220, 555, end: 212.5, 526.0)
+		path.line(to: s(106.3, 114.2))
+		q(path, control: 100, 90, end: 122.5, 101.0)
 		path.close()
 		return path
 	}
