@@ -3241,30 +3241,43 @@ final class Bridge {
 		return try screenshotPayload(image: image, windowId: windowId)
 	}
 
+	// Cap on the longest image edge before PNG encoding. Vertex AI rejects
+	// many-image requests when any one image exceeds 2576 px/side (observed
+	// empirically: "image dimensions exceed max allowed size for many-image
+	// requests: 2576 pixels"). Anthropic publishes a 1568 recommendation but
+	// it appears to be advisory, not a hard cap - sticking with the observed
+	// hard limit until we confirm 1568 is actually enforced. The model still
+	// gets exact window-point coords from the envelope; the image is a
+	// fallback aid.
+	private static let maxImageEdgePixels: Int = 2576
+
 	private func screenshotPayload(image: CGImage, windowId: UInt32) throws -> [String: Any] {
-		guard let pngData = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+		let downscaled = downscaleIfNeeded(image)
+		guard let pngData = NSBitmapImageRep(cgImage: downscaled).representation(using: .png, properties: [:]) else {
 			throw BridgeFailure(message: "Failed to encode screenshot as PNG", code: "encoding_failed")
 		}
 
-		// Derive scaleFactor by comparing the actual captured image's pixel
-		// dimensions to the window's logical-point frame. The previous
-		// implementation called currentWindowBounds (SCK with 2s timeout),
-		// which returns nil when SCK is slow or the window is off-Space,
-		// silently falling back to scale=1 even on retina displays. Using
-		// the image we just captured + the cached AX frame is reliable and
-		// avoids an extra round-trip.
+		// Derive scaleFactor by comparing the *returned* image's pixel
+		// dimensions (post-downscale) to the window's logical-point frame. The
+		// previous implementation called currentWindowBounds (SCK with 2s
+		// timeout), which returns nil when SCK is slow or the window is
+		// off-Space, silently falling back to scale=1 even on retina displays.
+		// Using the image we just produced + the cached AX frame is reliable
+		// and avoids an extra round-trip. When we downscale (long edge > 1568),
+		// scale becomes a non-integer (e.g. 1.77 instead of 2.0); the agent
+		// reads it from the `Coords:` envelope line and divides accordingly.
 		var scale: Double = Double(NSScreen.main?.backingScaleFactor ?? 1.0)
 		var windowSize: CGSize? = nil
 		if let bounds = currentWindowBounds(windowId: windowId), bounds.size.height > 0 {
-			let derived = Double(image.height) / Double(bounds.size.height)
-			if derived > 0.5 { scale = derived }
+			let derived = Double(downscaled.height) / Double(bounds.size.height)
+			if derived > 0.1 { scale = derived }
 			windowSize = bounds.size
 		}
 
 		var payload: [String: Any] = [
 			"pngBase64": pngData.base64EncodedString(),
-			"width": image.width,
-			"height": image.height,
+			"width": downscaled.width,
+			"height": downscaled.height,
 			"scaleFactor": scale,
 		]
 		if let windowSize {
@@ -3272,6 +3285,31 @@ final class Bridge {
 			payload["windowHeight"] = windowSize.height
 		}
 		return payload
+	}
+
+	private func downscaleIfNeeded(_ image: CGImage) -> CGImage {
+		let longest = max(image.width, image.height)
+		if longest <= Self.maxImageEdgePixels {
+			return image
+		}
+		let ratio = Double(Self.maxImageEdgePixels) / Double(longest)
+		let newWidth = max(1, Int((Double(image.width) * ratio).rounded()))
+		let newHeight = max(1, Int((Double(image.height) * ratio).rounded()))
+		guard let colorSpace = image.colorSpace else { return image }
+		guard let ctx = CGContext(
+			data: nil,
+			width: newWidth,
+			height: newHeight,
+			bitsPerComponent: 8,
+			bytesPerRow: 0,
+			space: colorSpace,
+			bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+		) else {
+			return image
+		}
+		ctx.interpolationQuality = .high
+		ctx.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
+		return ctx.makeImage() ?? image
 	}
 
 	private func cgWindowScreenshot(windowId: UInt32) throws -> [String: Any]? {
