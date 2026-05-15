@@ -1484,6 +1484,34 @@ function appMatchesWindowQuery(app: HelperApp, query: ListWindowsParams): boolea
 	return true;
 }
 
+/**
+ * One-line summary of the agent's current operating mode. Surfaced at
+ * the top of screenshot / list_apps / list_windows responses so the
+ * agent learns its constraints (especially stealth mode) on the very
+ * first call instead of by failing into the strict-mode error message.
+ *
+ * Format is intentionally compact and front-loaded with the most
+ * surprising thing ("stealth") so the agent's tool-use planner
+ * notices it without us having to teach the agent about a long
+ * paragraph in the skill.
+ *
+ * Always renders even outside stealth so the agent gets a consistent
+ * mental model of what's available; on by default in normal mode is
+ * cheap and removes the "oh, AppleScript existed all along" surprise.
+ */
+function formatModeMarker(): string {
+	const config = getComputerUseConfig();
+	const bits: string[] = [];
+	bits.push(`mode: ${config.stealth_mode ? "stealth (AX-only)" : "normal"}`);
+	if (config.stealth_mode) {
+		bits.push("avoid: type_text, raw keypress without AX equivalent, arrange_window above frontmost");
+		bits.push("prefer: set_text(ref), AX-action keypresses (Enter/Escape/Tab/Space), navigate_browser, apple_script");
+	}
+	bits.push(`apple_script: ${config.apple_script.enabled ? "enabled" : "disabled"}`);
+	bits.push(`browser_use: ${config.browser_use ? "allowed" : "blocked"}`);
+	return bits.join(" \u00b7 ");
+}
+
 function formatAppLine(app: ListAppsDetails["apps"][number]): string {
 	const flags = [app.isFrontmost ? "frontmost" : undefined, app.browserUseAllowed ? undefined : "browser_use_disabled"]
 		.filter(Boolean)
@@ -2415,7 +2443,12 @@ async function buildToolResult(
 		? `\n\nPrefer these AX targets over coordinate clicks or focus-based text replacement when one matches your intent:\n${result.axTargets.map(formatAxTargetLabel).join("\n")}`
 		: "";
 	const fallbackText = fallbackReason ? `\n\n${fallbackReason.message}` : "";
-	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${summary}${axTargetText}${fallbackText}${appInstructionsText}` }];
+	// Prepend a one-line mode marker on screenshot results only. Other
+	// tools (click/keypress/etc.) fire often enough that repeating the
+	// marker would be noise; screenshot is the natural "start of
+	// inspection" moment, mirroring how we ship app instructions there.
+	const markerText = tool === "screenshot" ? `[${formatModeMarker()}]\n` : "";
+	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${markerText}${summary}${axTargetText}${fallbackText}${appInstructionsText}` }];
 	if (fallbackReason) {
 		content.push({ type: "image", data: result.image!.pngBase64, mimeType: "image/png" });
 	}
@@ -3139,10 +3172,11 @@ async function performListApps(signal?: AbortSignal): Promise<AgentToolResult<Li
 		config,
 	};
 	const lines = details.apps.map(formatAppLine);
-	const text = lines.length
+	const marker = `[${formatModeMarker()}]`;
+	const body = lines.length
 		? `Found ${lines.length} running app${lines.length === 1 ? "" : "s"}. Use list_windows with app, bundleId, or pid to inspect target windows.\n${lines.join("\n")}`
 		: "No running apps were available to pi-computer-use.";
-	return { content: [{ type: "text", text }], details };
+	return { content: [{ type: "text", text: `${marker}\n${body}` }], details };
 }
 
 async function performListWindows(params: ListWindowsParams, signal?: AbortSignal): Promise<AgentToolResult<ListWindowsDetails>> {
@@ -3193,10 +3227,11 @@ async function performListWindows(params: ListWindowsParams, signal?: AbortSigna
 	const offSpaceHint = offSpaceCount > 0
 		? ` ${offSpaceCount} window${offSpaceCount === 1 ? " is" : "s are"} on another Space; use wake_window({ windowRef }) to bring ${offSpaceCount === 1 ? "it" : "them"} to the active Space.`
 		: "";
-	const text = lines.length
+	const marker = `[${formatModeMarker()}]`;
+	const body = lines.length
 		? `Found ${lines.length} controllable window${lines.length === 1 ? "" : "s"}. Use the @w refs with screenshot({ window: "@wN" }) or action tools' optional window field.${offSpaceHint}\n${lines.join("\n")}`
 		: `No controllable windows matched the query. Try opening a window, or call list_apps to confirm the app is running.`;
-	return { content: [{ type: "text", text }], details };
+	return { content: [{ type: "text", text: `${marker}\n${body}` }], details };
 }
 
 function normalizeImageMode(value: unknown): ImageMode {

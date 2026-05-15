@@ -47,3 +47,29 @@ Use these tools when shell/file tools are not enough and you need to operate a m
 If an action reports stale state, target mismatch, or missing target/window, call `screenshot` again to refresh and continue.
 
 If a browser reports that JavaScript from Apple Events is disabled, stop and prompt the user to enable "Allow JavaScript from Apple Events" in the browser's developer menu. Retry the browser action after the user confirms it is enabled.
+
+### Recovery loop: "the controlled window is no longer available"
+
+This error usually does **not** mean the window is gone. The most common cause is that the user switched macOS Spaces, leaving the window on a different Space where it's still fully addressable but invisible.
+
+1. Call `list_windows({ pid })` (or `list_windows({ app })`). If the window appears with `off_active_space` in its flags, the window is just on another Space.
+2. Call `wake_window({ windowRef: "@wN" })` to bring it onto the active Space. This activates the app politely without stealing foreground from the user's current app.
+3. Call `screenshot({ window: "@wN" })` to inspect the now-visible window.
+4. Resume your task.
+
+If the controlled-window error message itself includes a `wake_window({ windowRef: "@wN" })` suggestion, follow it directly — the resolver already detected the off-Space case for you.
+
+If `list_windows` returns no entries at all and `list_apps` doesn't list the app either, the app has actually quit. Re-launch it with `bash: open -a <AppName>` (or the appropriate launcher) and re-run `screenshot`.
+
+If `list_apps` still lists the app but `list_windows` returns nothing even after `wake_window`, the app has no open windows. For most apps `bash: open -a <AppName>` will create a default window; for some, the agent has to use the app's own "new window" shortcut (e.g. `keypress({ keys: ["Command+N"] })`).
+
+### Recovery loop: stealth-mode block
+
+If a tool call returns a `strict_mode` error in stealth mode, the error already names the AX-only alternative. Common substitutions:
+
+- `type_text` → `set_text({ ref, text })` against the focused field's AX target. Call `screenshot` first if you don't have a ref.
+- raw `keypress` (no AX equivalent) → see if the action has an AX target with `press` or `confirm` action and use `click({ ref })` or `keypress` with an AX-mapped key (Enter/Escape/Tab/Space/arrows are AX-routed).
+- `arrange_window` → not available in stealth; pick a different window or skip.
+- when the AX path is genuinely insufficient (Catalyst app, Messages composer, etc.), the `apple_script` tool is your escape hatch — it delivers Apple Events directly without raising the target app, and the screenshot envelope marker tells you whether it's enabled in this session.
+
+The `[mode: ...]` marker at the top of `screenshot`, `list_apps`, and `list_windows` responses tells you what's currently allowed. Read it before planning your next action.
