@@ -152,6 +152,7 @@ interface ExecutionTrace {
 		| "browser_open_location"
 		| "ax_set_value"
 		| "raw_keypress"
+		| "per_pid_keypress"
 		| "raw_key_text";
 	axAttempted?: boolean;
 	axSucceeded?: boolean;
@@ -2712,8 +2713,25 @@ async function dispatchKeypress(params: KeypressParams, target: ResolvedTarget, 
 		return executionTrace("ax_action", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
+	// Stealth keypress path: events are delivered via event.postToPid(pid) on
+	// the helper side, NOT via the global CGEventPost session tap. postToPid
+	// goes to the target app's event queue and does not move the system cursor
+	// or change the frontmost app. That's mechanically stealth-safe — the
+	// same primitive OpenAI's Sky CUA helper uses for the same reason.
+	//
+	// We deliberately skip focusControlledWindow() here in stealth mode: that
+	// call would raise the target window above the user's frontmost (a real
+	// stealth-contract violation). The trade-off is keypress becomes
+	// best-effort for apps that gate input on foreground status. Empirically
+	// Slack/Electron, Chrome, and most modern apps accept postToPid events
+	// without being foreground; some legacy AppKit apps may not.
 	if (isStrictAxMode()) {
-		strictModeBlock("Keypress is not AX-only and no semantic AX equivalent was available.");
+		await bridgeCommand("keyPress", { keys, pid: target.pid }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
+		return executionTrace("per_pid_keypress", "stealth", {
+			axAttempted: semanticActionsForKeys(keys).length > 0,
+			axSucceeded: false,
+			fallbackUsed: semanticActionsForKeys(keys).length > 0,
+		});
 	}
 	await focusControlledWindow(target, signal);
 	await bridgeCommand("keyPress", { keys, pid: target.pid }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
