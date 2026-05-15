@@ -5,6 +5,13 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 export interface ComputerUseConfig {
 	browser_use: boolean;
 	stealth_mode: boolean;
+	apple_script: AppleScriptConfig;
+}
+
+export interface AppleScriptConfig {
+	enabled: boolean;
+	restore_frontmost_on_drift: boolean;
+	timeout_ms: number;
 }
 
 export interface ComputerUseConfigSource {
@@ -20,9 +27,16 @@ export interface LoadedComputerUseConfig {
 	env: Partial<ComputerUseConfig>;
 }
 
+const DEFAULT_APPLE_SCRIPT_CONFIG: AppleScriptConfig = {
+	enabled: true,
+	restore_frontmost_on_drift: true,
+	timeout_ms: 5000,
+};
+
 const DEFAULT_CONFIG: ComputerUseConfig = {
 	browser_use: true,
 	stealth_mode: false,
+	apple_script: { ...DEFAULT_APPLE_SCRIPT_CONFIG },
 };
 
 let activeConfig: ComputerUseConfig = { ...DEFAULT_CONFIG };
@@ -38,6 +52,21 @@ function parseBoolean(value: unknown): boolean | undefined {
 	return undefined;
 }
 
+function normalizeAppleScript(raw: unknown): Partial<AppleScriptConfig> | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const src = raw as any;
+	const out: Partial<AppleScriptConfig> = {};
+	const enabled = parseBoolean(src.enabled);
+	const restoreFrontmost = parseBoolean(src.restore_frontmost_on_drift ?? src.restoreFrontmostOnDrift);
+	const timeoutMs = src.timeout_ms ?? src.timeoutMs;
+	if (enabled !== undefined) out.enabled = enabled;
+	if (restoreFrontmost !== undefined) out.restore_frontmost_on_drift = restoreFrontmost;
+	if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+		out.timeout_ms = Math.trunc(timeoutMs);
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizePartial(raw: unknown): Partial<ComputerUseConfig> {
 	if (!raw || typeof raw !== "object") return {};
 	const source = (raw as any).computer_use && typeof (raw as any).computer_use === "object" ? (raw as any).computer_use : raw;
@@ -46,6 +75,10 @@ function normalizePartial(raw: unknown): Partial<ComputerUseConfig> {
 	const stealthMode = parseBoolean((source as any).stealth_mode ?? (source as any).stealthMode);
 	if (browserUse !== undefined) out.browser_use = browserUse;
 	if (stealthMode !== undefined) out.stealth_mode = stealthMode;
+	const appleScript = normalizeAppleScript((source as any).apple_script ?? (source as any).appleScript);
+	if (appleScript) {
+		out.apple_script = { ...DEFAULT_APPLE_SCRIPT_CONFIG, ...appleScript };
+	}
 	return out;
 }
 
@@ -68,6 +101,10 @@ function readEnv(): Partial<ComputerUseConfig> {
 	if (parseBoolean(process.env.PI_COMPUTER_USE_STEALTH) === true || parseBoolean(process.env.PI_COMPUTER_USE_STRICT_AX) === true) {
 		out.stealth_mode = true;
 	}
+	const appleScriptEnabled = parseBoolean(process.env.PI_COMPUTER_USE_APPLE_SCRIPT);
+	if (appleScriptEnabled !== undefined) {
+		out.apple_script = { ...DEFAULT_APPLE_SCRIPT_CONFIG, enabled: appleScriptEnabled };
+	}
 	return out;
 }
 
@@ -77,7 +114,10 @@ export function loadComputerUseConfig(cwd: string): LoadedComputerUseConfig {
 		readConfigFile(path.join(cwd, ".pi", "computer-use.json")),
 	];
 	const env = readEnv();
-	const config = { ...DEFAULT_CONFIG };
+	const config: ComputerUseConfig = {
+		...DEFAULT_CONFIG,
+		apple_script: { ...DEFAULT_CONFIG.apple_script },
+	};
 	for (const source of sources) {
 		if (source.values) Object.assign(config, source.values);
 	}
@@ -101,4 +141,8 @@ export function isStrictAxMode(): boolean {
 
 export function isBrowserUseEnabled(): boolean {
 	return activeConfig.browser_use;
+}
+
+export function getAppleScriptConfig(): AppleScriptConfig {
+	return activeConfig.apple_script;
 }

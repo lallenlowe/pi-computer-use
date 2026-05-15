@@ -2,6 +2,7 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
 	ensureComputerUseSetup,
+	executeAppleScript,
 	executeArrangeWindow,
 	executeClick,
 	executeComputerActions,
@@ -439,6 +440,31 @@ const batchedActionSchema = Type.Union([
 	}),
 ]);
 
+const appleScriptTool = defineTool({
+	name: "apple_script",
+	label: "AppleScript",
+	description:
+		"Run an AppleScript via osascript and return stdout/stderr plus frontmost-app drift detection. Use this for app operations that AX can't reach (Messages send, Mail compose, Notes create, Music playback, Finder commands, etc.) where the app exposes an AppleScript dictionary. Apple Events are delivered to the target process directly and do not raise its window or change frontmost \u2014 stealth-safe by mechanism, same guarantee as per-PID keypress.",
+	promptSnippet:
+		"Run an AppleScript when AX/keypress can't drive the operation. Common cases: sending iMessage via Messages, Mail compose, Music transport, Finder commands.",
+	promptGuidelines: [
+		"Prefer AX-only paths (click/set_text/keypress) when they can do the job. Use apple_script when AX cannot \u2014 e.g. Messages.app's composer accepts set_text but the Send button is gated on a UITextInput notification AX setValue does not fire, so 'tell application \"Messages\" to send X to chat Y' is the canonical workaround.",
+		"Apple Events do not raise the target app's window or change the frontmost app. Some scripts (those that explicitly call 'activate' or open a file dialog) will still cause drift; the tool reports frontmostBefore/After/Drifted in details and (by default) restores the original frontmost on drift.",
+		"Pass 'app' to label the call for traces; it does not affect execution.",
+		"Multi-line scripts work; the script body is written to a temp file, no shell escaping required.",
+		"Do not use this to perform user-irreversible actions (sending, deleting, posting) without confirming with the user first \u2014 same safety bar as keypress(['Return']) in a chat composer.",
+	],
+	executionMode: "sequential",
+	parameters: Type.Object({
+		script: Type.String({ description: "AppleScript source. Multi-line OK." }),
+		app: Type.Optional(Type.String({ description: "Optional app name for trace/diagnostics, e.g. 'Messages'" })),
+		timeoutMs: Type.Optional(Type.Number({ description: "Per-call timeout in milliseconds (default from config, capped at 60000)" })),
+	}),
+	async execute(toolCallId, params, signal, onUpdate, ctx) {
+		return await executeAppleScript(toolCallId, params, signal, onUpdate, ctx);
+	},
+});
+
 const computerActionsTool = defineTool({
 	name: "computer_actions",
 	label: "Computer Actions",
@@ -469,6 +495,7 @@ function formatConfigStatus(): string {
 		"",
 		`browser_use: ${loaded.config.browser_use ? "enabled" : "disabled"}`,
 		`stealth_mode: ${loaded.config.stealth_mode ? "enabled" : "disabled"}`,
+		`apple_script: ${loaded.config.apple_script.enabled ? "enabled" : "disabled"} (restore_frontmost_on_drift=${loaded.config.apple_script.restore_frontmost_on_drift}, timeout_ms=${loaded.config.apple_script.timeout_ms})`,
 		"",
 		"Sources:",
 	];
@@ -506,6 +533,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 		pi.registerTool(arrangeWindowTool);
 		pi.registerTool(navigateBrowserTool);
 		pi.registerTool(computerActionsTool);
+		pi.registerTool(appleScriptTool);
 	} catch (error) {
 		if (isDuplicateToolConflict(error)) {
 			return;
