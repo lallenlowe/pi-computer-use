@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAppleScriptConfig, getComputerUseConfig, getOverlayConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
+import { getAppleScriptConfig, getComputerUseConfig, getOverlayConfig, isBrowserUseEnabled, loadComputerUseConfig } from "./config.ts";
 import { ensurePermissions, type PermissionStatus } from "./permissions.ts";
 import { loadAppInstructions, type AppInstructions } from "./app-instructions.ts";
 import { performAppleScript, type AppleScriptDetails, type AppleScriptParams } from "./apple-script.ts";
@@ -233,8 +233,6 @@ interface ActivationFlags {
 	raised: boolean;
 }
 
-type ExecutionVariant = "stealth" | "default";
-
 interface ExecutionTrace {
 	strategy:
 		| "screenshot"
@@ -258,10 +256,6 @@ interface ExecutionTrace {
 	axAttempted?: boolean;
 	axSucceeded?: boolean;
 	fallbackUsed?: boolean;
-	runtimeMode?: ExecutionVariant;
-	variant?: ExecutionVariant;
-	stealthCompatible?: boolean;
-	nonStealthReason?: string;
 	actionCount?: number;
 	completedActionCount?: number;
 	actions?: BatchActionTrace[];
@@ -275,10 +269,6 @@ interface BatchActionTrace {
 	axAttempted?: boolean;
 	axSucceeded?: boolean;
 	fallbackUsed?: boolean;
-	runtimeMode?: ExecutionVariant;
-	variant?: ExecutionVariant;
-	stealthCompatible?: boolean;
-	nonStealthReason?: string;
 }
 
 export interface ComputerUseDetails {
@@ -311,10 +301,6 @@ export interface ComputerUseDetails {
 	axTargets?: AxTarget[];
 	activation: ActivationFlags;
 	execution: ExecutionTrace;
-	config?: {
-		browser_use: boolean;
-		stealth_mode: boolean;
-	};
 	status?: "ok";
 	axDiagnostics?: {
 		reason?: string;
@@ -347,10 +333,6 @@ export interface ListAppsDetails {
 		isFrontmost: boolean;
 		browserUseAllowed: boolean;
 	}>;
-	config: {
-		browser_use: boolean;
-		stealth_mode: boolean;
-	};
 }
 
 export interface ListWindowsDetails {
@@ -374,10 +356,6 @@ export interface ListWindowsDetails {
 		browserUseAllowed: boolean;
 		score: number;
 	}>;
-	config: {
-		browser_use: boolean;
-		stealth_mode: boolean;
-	};
 }
 
 interface HelperApp {
@@ -692,52 +670,31 @@ function isRecoverableScreenshotError(error: unknown): error is HelperCommandErr
 	return error instanceof HelperCommandError && !!error.code && RECOVERABLE_SCREENSHOT_ERROR_CODES.has(error.code);
 }
 
-function currentRuntimeMode(): ExecutionVariant {
-	return isStrictAxMode() ? "stealth" : "default";
-}
-
 function executionTrace(
 	strategy: ExecutionTrace["strategy"],
-	variant: ExecutionVariant,
-	metadata: Omit<ExecutionTrace, "strategy" | "runtimeMode" | "variant" | "stealthCompatible"> = {},
+	metadata: Omit<ExecutionTrace, "strategy"> = {},
 ): ExecutionTrace {
 	return {
 		strategy,
-		runtimeMode: currentRuntimeMode(),
-		variant,
-		stealthCompatible: variant === "stealth",
 		...metadata,
 	};
 }
 
-function strictModeBlock(message: string, alternative?: string): never {
-	const altClause = alternative ? ` Try instead: ${alternative}` : "";
-	throw new Error(
-		`${message} Stealth/strict AX mode is enabled, so non-AX, foreground-focus, and cursor fallbacks are blocked.${altClause}`,
-	);
-}
-
 function settleMsForExecution(execution: ExecutionTrace): number {
-	if (execution.strategy === "batch") {
-		const actions = execution.actions ?? [];
-		return actions.length > 0 && actions.every((action) => action.variant === "stealth") ? 120 : ACTION_SETTLE_MS;
+	switch (execution.strategy) {
+		case "ax_focus":
+		case "ax_set_value":
+			return 80;
+		case "batch":
+		case "ax_action":
+		case "browser_open_location":
+		case "ax_scroll":
+			return 120;
+		case "ax_press":
+			return 160;
+		default:
+			return ACTION_SETTLE_MS;
 	}
-	if (execution.variant === "stealth") {
-		switch (execution.strategy) {
-			case "ax_focus":
-			case "ax_set_value":
-				return 80;
-			case "ax_action":
-			case "browser_open_location":
-			case "ax_scroll":
-				return 120;
-			case "ax_press":
-				return 160;
-			default:
-				return 120;
-		}
-	}
-	return ACTION_SETTLE_MS;
 }
 
 function addRefreshHint(error: unknown): Error {
@@ -1556,39 +1513,25 @@ function appMatchesWindowQuery(app: HelperApp, query: ListWindowsParams): boolea
 }
 
 /**
- * One-line summary of the agent's current operating mode. Surfaced at
- * the top of screenshot / list_apps / list_windows responses so the
- * agent learns its constraints (especially stealth mode) on the very
- * first call instead of by failing into the strict-mode error message.
+ * One-line summary of the agent's current operating contract.
+ * Surfaced at the top of screenshot / list_apps / list_windows
+ * responses so the agent learns its constraints on the very first
+ * call instead of by failing into a tool error.
  *
- * Format is intentionally compact and front-loaded with the most
- * surprising thing ("stealth") so the agent's tool-use planner
- * notices it without us having to teach the agent about a long
- * paragraph in the skill.
- *
- * Always renders even outside stealth so the agent gets a consistent
- * mental model of what's available; on by default in normal mode is
- * cheap and removes the "oh, AppleScript existed all along" surprise.
+ * The contract is fixed: input ops (clicks, keypresses, type_text,
+ * scroll, drag, set_text) all use per-PID delivery and never change
+ * frontmost. The only tools that change frontmost are surface_window
+ * and launch_app({activate:true}), and they go through
+ * requireFocusChangeApproval - either ctx.ui.confirm (default) or an
+ * automatic yes when focus_auto_approve is on.
  */
 function formatModeMarker(): string {
 	const config = getComputerUseConfig();
 	const bits: string[] = [];
-	bits.push(`mode: ${config.stealth_mode ? "stealth" : "normal"}`);
-	if (config.stealth_mode) {
-		// Stealth model v2: stealth blocks SURPRISE FOCUS CHANGES, not
-		// input mechanism. Coordinate clicks, keypresses, type_text,
-		// scroll, drag all work via per-PID delivery. The only blocked
-		// ops are those that would surface a window without explicit
-		// user permission: surface_window (gated, asks user), launch_app
-		// with activate=true (gated, asks user).
-		// (Browser address-bar navigation is just the regular AX-only path:
-		// keypress Command+L, set_text the URL, keypress Enter.)
-		bits.push("rule: don't change frontmost without user permission; everything else is allowed");
-		bits.push("focus-changing tools (need user permission): surface_window, launch_app({activate:true})");
-	}
+	bits.push("contract: input ops never steal focus; surface_window + launch_app({activate:true}) ask the user via ctx.ui.confirm");
+	bits.push(`focus_auto_approve: ${config.focus_auto_approve ? "on (focus tools skip the confirm prompt)" : "off (focus tools prompt the user)"}`);
 	bits.push(`apple_script: ${config.apple_script.enabled ? "enabled" : "disabled"}`);
 	bits.push(`browser_use: ${config.browser_use ? "allowed" : "blocked"}`);
-	bits.push(`focus_auto_approve: ${config.focus_auto_approve ? "on (focus tools skip the confirm prompt)" : "off (surface_window / launch_app({activate:true}) prompt the user)"}`);
 	return bits.join(" \u00b7 ");
 }
 
@@ -2373,7 +2316,6 @@ async function buildToolResult(
 		execution,
 		axDiagnostics: result.axDiagnostics,
 		status: "ok",
-		config: getComputerUseConfig(),
 		imageReason: fallbackReason?.reason,
 	};
 
@@ -2497,7 +2439,7 @@ async function dispatchClick(
 			throw new Error(`AX click/focus could not be completed for ${ref}.`);
 		}
 
-		return executionTrace(clickedViaAX ? "ax_press" : "ax_focus", "stealth", {
+		return executionTrace(clickedViaAX ? "ax_press" : "ax_focus", {
 			axAttempted: true,
 			axSucceeded: true,
 			fallbackUsed: false,
@@ -2574,12 +2516,10 @@ async function dispatchClick(
 	const usedAxPath = clickedViaAX || focusedViaAX;
 	return executionTrace(
 		clickedViaAX ? "ax_press" : focusedViaAX ? "ax_focus" : clickCount > 1 ? "coordinate_event_double_click" : "coordinate_event_click",
-		usedAxPath ? "stealth" : "default",
 		{
 			axAttempted: canTryAX,
 			axSucceeded: usedAxPath,
 			fallbackUsed: canTryAX && !usedAxPath,
-			nonStealthReason: usedAxPath ? undefined : "coordinate_mouse_click_requires_pointer_event",
 		},
 	);
 }
@@ -2590,7 +2530,7 @@ async function dispatchTypeText(text: string, target: ResolvedTarget, signal?: A
 		const focusedElementRef = await focusedTextElementRef(target, signal);
 		if (focusedElementRef) {
 			await setAxValue(focusedElementRef, text, signal);
-			return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+			return executionTrace("ax_set_value", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 		}
 	}
 	// Stealth v2: post the keystrokes via per-PID delivery. set_text
@@ -2602,7 +2542,7 @@ async function dispatchTypeText(text: string, target: ResolvedTarget, signal?: A
 		{ text, pid: target.pid },
 		{ signal, timeoutMs: Math.min(90_000, Math.max(COMMAND_TIMEOUT_MS, text.length * 25 + 4_000)) },
 	);
-	return executionTrace("raw_key_text", "stealth", {
+	return executionTrace("raw_key_text", {
 		axAttempted: false,
 		axSucceeded: false,
 		fallbackUsed: false,
@@ -2649,14 +2589,14 @@ async function dispatchSetText(params: SetTextParams, target: ResolvedTarget, si
 		if (axTarget.canSetValue !== false) {
 			try {
 				await setAxValue(axTarget.elementRef, params.text, signal);
-				return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+				return executionTrace("ax_set_value", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 			} catch (error) {
 				if (isElementRefInvalid(error)) {
 					const reacquired = await reacquireAxTarget(axTarget, target, signal);
 					if (reacquired && reacquired.canSetValue !== false) {
 						axTarget = reacquired;
 						await setAxValue(axTarget.elementRef, params.text, signal);
-						return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+						return executionTrace("ax_set_value", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 					}
 				}
 				// Stealth v2: fall through to focus + setValue path (which
@@ -2681,7 +2621,7 @@ async function dispatchSetText(params: SetTextParams, target: ResolvedTarget, si
 			const focusedElementRef = await focusedTextElementRef(target, signal);
 			if (focusedElementRef) {
 				await setAxValue(focusedElementRef, params.text, signal);
-				return executionTrace("ax_set_value", "stealth", {
+				return executionTrace("ax_set_value", {
 					axAttempted: true,
 					axSucceeded: true,
 					fallbackUsed: false,
@@ -2693,7 +2633,7 @@ async function dispatchSetText(params: SetTextParams, target: ResolvedTarget, si
 	const focusedElementRef = await focusedTextElementRef(target, signal);
 	if (focusedElementRef) {
 		await setAxValue(focusedElementRef, params.text, signal);
-		return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+		return executionTrace("ax_set_value", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
 	// Stealth v2: no AX text target found, no currently-focused text
@@ -2827,12 +2767,12 @@ async function dispatchKeypress(params: KeypressParams, target: ResolvedTarget, 
 
 	const focusedAddressViaAX = await focusBrowserAddressField(keys, target, signal);
 	if (focusedAddressViaAX) {
-		return executionTrace("ax_focus", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+		return executionTrace("ax_focus", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
 	const performedViaAX = await tryFocusedAxKeyAction(keys, target, signal);
 	if (performedViaAX) {
-		return executionTrace("ax_action", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+		return executionTrace("ax_action", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
 	// Stealth keypress path: events are delivered via event.postToPid(pid) on
@@ -2848,7 +2788,7 @@ async function dispatchKeypress(params: KeypressParams, target: ResolvedTarget, 
 	// do), the input is best-effort. Modern apps (Electron/Catalyst/
 	// Cocoa) honor per-PID keystrokes whether or not foreground.
 	await bridgeCommand("keyPress", { keys, pid: target.pid }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
-	return executionTrace("per_pid_keypress", "stealth", {
+	return executionTrace("per_pid_keypress", {
 		axAttempted: semanticActionsForKeys(keys).length > 0,
 		axSucceeded: false,
 		fallbackUsed: semanticActionsForKeys(keys).length > 0,
@@ -2931,7 +2871,7 @@ async function dispatchScroll(
 	}
 
 	if (scrollAttempt.scrolled) {
-		return executionTrace("ax_scroll", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+		return executionTrace("ax_scroll", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
 	const reasonText = scrollAttempt.reason ? ` Reason: ${scrollAttempt.reason}.` : "";
@@ -2953,11 +2893,10 @@ async function dispatchScroll(
 		},
 		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 	);
-	return executionTrace("coordinate_event_scroll", "default", {
+	return executionTrace("coordinate_event_scroll", {
 		axAttempted: true,
 		axSucceeded: false,
 		fallbackUsed: true,
-		nonStealthReason: "coordinate_scroll_requires_pointer_event",
 	});
 }
 
@@ -2979,11 +2918,10 @@ async function dispatchMoveMouse(
 		{ ...nativeWindowRequest(target), x, y, ...captureRequest(capture) },
 		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 	);
-	return executionTrace("coordinate_event_move", "default", {
+	return executionTrace("coordinate_event_move", {
 		axAttempted: false,
 		axSucceeded: false,
 		fallbackUsed: false,
-		nonStealthReason: "mouse_move_requires_cursor_control",
 	});
 }
 
@@ -3035,7 +2973,7 @@ async function dispatchDrag(
 		}
 	}
 	if (adjustedViaAX) {
-		return executionTrace("ax_action", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+		return executionTrace("ax_action", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 	// Stealth v2: coordinate drag is allowed - per-PID delivery, no
 	// window raise.
@@ -3047,11 +2985,10 @@ async function dispatchDrag(
 		{ ...nativeWindowRequest(target), path, ...captureRequest(capture) },
 		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 	);
-	return executionTrace("coordinate_event_drag", "default", {
+	return executionTrace("coordinate_event_drag", {
 		axAttempted: Boolean(ref),
 		axSucceeded: false,
 		fallbackUsed: Boolean(ref),
-		nonStealthReason: "drag_requires_pointer_event",
 	});
 }
 
@@ -3096,7 +3033,6 @@ async function performListApps(signal?: AbortSignal): Promise<AgentToolResult<Li
 			isFrontmost: app.isFrontmost === true,
 			browserUseAllowed: config.browser_use || !isBrowserApp(app.appName, app.bundleId),
 		})),
-		config,
 	};
 	const lines = details.apps.map(formatAppLine);
 	const marker = `[${formatModeMarker()}]`;
@@ -3148,7 +3084,7 @@ async function performListWindows(params: ListWindowsParams, signal?: AbortSigna
 	}
 	windows.sort((a, b) => b.score - a.score || a.app.localeCompare(b.app) || a.windowTitle.localeCompare(b.windowTitle));
 
-	const details: ListWindowsDetails = { tool: "list_windows", query, windows, config };
+	const details: ListWindowsDetails = { tool: "list_windows", query, windows };
 	const lines = windows.map(formatWindowLine);
 	const offSpaceCount = windows.filter((w) => !w.isOnActiveSpace && !w.isMinimized).length;
 	const offSpaceHint = offSpaceCount > 0
@@ -3183,7 +3119,7 @@ async function performScreenshot(params: ScreenshotParams, signal?: AbortSignal)
 		);
 	}
 	const summary = `Captured ${captureResult.target.windowRef ? `${captureResult.target.windowRef} ` : ""}${captureResult.target.appName} — ${captureResult.target.windowTitle}. Returned the latest semantic window state.`;
-	return await buildToolResult("screenshot", summary, captureResult, executionTrace("screenshot", "stealth", { fallbackUsed: false }), signal, normalizeImageMode(params.image));
+	return await buildToolResult("screenshot", summary, captureResult, executionTrace("screenshot", { fallbackUsed: false }), signal, normalizeImageMode(params.image));
 }
 
 async function performClick(params: ClickParams, signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails>> {
@@ -3389,7 +3325,7 @@ async function dispatchComputerAction(
 				throw new Error("wait.ms must be a non-negative number.");
 			}
 			await sleep(Math.min(60_000, Math.round(msRaw)), signal);
-			return executionTrace("wait", "stealth", { fallbackUsed: false });
+			return executionTrace("wait", { fallbackUsed: false });
 		}
 		default:
 			throw new Error(`Unsupported computer action '${(action as any)?.type ?? "unknown"}'.`);
@@ -3445,7 +3381,7 @@ async function performArrangeWindow(params: ArrangeWindowParams, signal?: AbortS
 			"arrange_window",
 			`Arranged ${captureResult.target.windowRef ? `${captureResult.target.windowRef} ` : ""}${captureResult.target.appName} — ${captureResult.target.windowTitle}. Returned the latest semantic window state.`,
 			captureResult,
-			executionTrace("window_frame", "stealth", { fallbackUsed: false }),
+			executionTrace("window_frame", { fallbackUsed: false }),
 			signal,
 		);
 	});
@@ -3472,8 +3408,6 @@ async function performComputerActions(params: ComputerActionsParams, signal?: Ab
 		let axAttempted = false;
 		let axSucceeded = false;
 		let fallbackUsed = false;
-		let stealthCompatible = true;
-		const nonStealthReasons = new Set<string>();
 		const actionTraces: BatchActionTrace[] = [];
 
 		for (let index = 0; index < actions.length; index += 1) {
@@ -3506,10 +3440,6 @@ async function performComputerActions(params: ComputerActionsParams, signal?: Ab
 				axAttempted: trace.axAttempted,
 				axSucceeded: trace.axSucceeded,
 				fallbackUsed: trace.fallbackUsed,
-				runtimeMode: trace.runtimeMode,
-				variant: trace.variant,
-				stealthCompatible: trace.stealthCompatible,
-				nonStealthReason: trace.nonStealthReason,
 			});
 			if (actionMayChangeState(action)) {
 				stateMayHaveChanged = true;
@@ -3517,23 +3447,18 @@ async function performComputerActions(params: ComputerActionsParams, signal?: Ab
 			axAttempted ||= trace.axAttempted === true;
 			axSucceeded ||= trace.axSucceeded === true;
 			fallbackUsed ||= trace.fallbackUsed === true;
-			stealthCompatible &&= trace.stealthCompatible === true;
-			if (trace.nonStealthReason) {
-				nonStealthReasons.add(trace.nonStealthReason);
-			}
 			if (index + 1 < actions.length && action?.type !== "wait") {
 				await sleep(BATCH_ACTION_GAP_MS, signal);
 			}
 		}
 
-		const execution = executionTrace("batch", stealthCompatible ? "stealth" : "default", {
+		const execution = executionTrace("batch", {
 			actionCount: actions.length,
 			completedActionCount: actionTraces.length,
 			actions: actionTraces,
 			axAttempted,
 			axSucceeded,
 			fallbackUsed,
-			nonStealthReason: nonStealthReasons.size > 0 ? [...nonStealthReasons].join(",") : undefined,
 		});
 		await sleep(settleMsForExecution(execution), signal);
 		const captureResult = await captureCurrentTarget(signal, activation);
@@ -3565,7 +3490,7 @@ async function performWait(params: WaitParams, signal?: AbortSignal): Promise<Ag
 	await sleep(ms, signal);
 	const captureResult = await captureCurrentTarget(signal);
 	const summary = `Waited ${ms}ms in ${captureResult.target.appName} — ${captureResult.target.windowTitle}. Returned the latest semantic window state.`;
-	return await buildToolResult("wait", summary, captureResult, executionTrace("wait", "stealth", { fallbackUsed: false }), signal);
+	return await buildToolResult("wait", summary, captureResult, executionTrace("wait", { fallbackUsed: false }), signal);
 }
 
 async function executeTool<T>(ctx: ExtensionContext, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {

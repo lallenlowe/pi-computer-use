@@ -53,11 +53,6 @@ export interface AppleScriptDetails {
 	frontmostDrifted: boolean;
 	restoreAttempted: boolean;
 	restoreSucceeded?: boolean;
-	stealthMode: boolean;
-	config: {
-		browser_use: boolean;
-		stealth_mode: boolean;
-	};
 }
 
 const READ_FRONTMOST_SCRIPT =
@@ -224,8 +219,6 @@ export async function performAppleScript(
 		frontmostDrifted: drifted,
 		restoreAttempted,
 		restoreSucceeded,
-		stealthMode: config.stealth_mode,
-		config,
 	};
 
 	return {

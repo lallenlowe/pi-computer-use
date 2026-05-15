@@ -4,7 +4,6 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface ComputerUseConfig {
 	browser_use: boolean;
-	stealth_mode: boolean;
 	/**
 	 * When true, focus-changing tools (surface_window,
 	 * launch_app({activate:true})) skip the user-approval prompt and
@@ -59,11 +58,21 @@ const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
 
 const DEFAULT_CONFIG: ComputerUseConfig = {
 	browser_use: true,
-	stealth_mode: false,
 	focus_auto_approve: false,
 	apple_script: { ...DEFAULT_APPLE_SCRIPT_CONFIG },
 	overlay: { ...DEFAULT_OVERLAY_CONFIG },
 };
+
+let warnedAboutLegacyStealth = false;
+function warnLegacyStealthOnce(source: string): void {
+	if (warnedAboutLegacyStealth) return;
+	warnedAboutLegacyStealth = true;
+	console.warn(
+		`[pi-computer-use] '${source}' is set but stealth_mode no longer exists - all input ops use the per-PID stealth path unconditionally. ` +
+		`Focus-changing tools (surface_window, launch_app({activate:true})) are now gated by focus_auto_approve (default off => prompts the user via ctx.ui.confirm). ` +
+		`You can remove stealth_mode from your config; this warning is informational and the value is ignored.`,
+	);
+}
 
 let activeConfig: ComputerUseConfig = { ...DEFAULT_CONFIG };
 let activeLoadedConfig: LoadedComputerUseConfig = { config: activeConfig, sources: [], env: {} };
@@ -124,10 +133,10 @@ function normalizePartial(raw: unknown): Partial<ComputerUseConfig> {
 	const source = (raw as any).computer_use && typeof (raw as any).computer_use === "object" ? (raw as any).computer_use : raw;
 	const out: Partial<ComputerUseConfig> = {};
 	const browserUse = parseBoolean((source as any).browser_use ?? (source as any).browserUse);
-	const stealthMode = parseBoolean((source as any).stealth_mode ?? (source as any).stealthMode);
+	const legacyStealth = parseBoolean((source as any).stealth_mode ?? (source as any).stealthMode);
 	const focusAutoApprove = parseBoolean((source as any).focus_auto_approve ?? (source as any).focusAutoApprove);
 	if (browserUse !== undefined) out.browser_use = browserUse;
-	if (stealthMode !== undefined) out.stealth_mode = stealthMode;
+	if (legacyStealth !== undefined) warnLegacyStealthOnce("stealth_mode");
 	if (focusAutoApprove !== undefined) out.focus_auto_approve = focusAutoApprove;
 	const appleScript = normalizeAppleScript((source as any).apple_script ?? (source as any).appleScript);
 	if (appleScript) {
@@ -153,14 +162,12 @@ function readConfigFile(filePath: string): ComputerUseConfigSource {
 function readEnv(): Partial<ComputerUseConfig> {
 	const out: Partial<ComputerUseConfig> = {};
 	const browserUse = parseBoolean(process.env.PI_COMPUTER_USE_BROWSER_USE);
-	const stealthMode = parseBoolean(process.env.PI_COMPUTER_USE_STEALTH_MODE);
 	const focusAutoApprove = parseBoolean(process.env.PI_COMPUTER_USE_FOCUS_AUTO_APPROVE);
 	if (browserUse !== undefined) out.browser_use = browserUse;
-	if (stealthMode !== undefined) out.stealth_mode = stealthMode;
 	if (focusAutoApprove !== undefined) out.focus_auto_approve = focusAutoApprove;
-	if (parseBoolean(process.env.PI_COMPUTER_USE_STEALTH) === true || parseBoolean(process.env.PI_COMPUTER_USE_STRICT_AX) === true) {
-		out.stealth_mode = true;
-	}
+	if (parseBoolean(process.env.PI_COMPUTER_USE_STEALTH_MODE) !== undefined) warnLegacyStealthOnce("PI_COMPUTER_USE_STEALTH_MODE");
+	if (parseBoolean(process.env.PI_COMPUTER_USE_STEALTH) === true) warnLegacyStealthOnce("PI_COMPUTER_USE_STEALTH");
+	if (parseBoolean(process.env.PI_COMPUTER_USE_STRICT_AX) === true) warnLegacyStealthOnce("PI_COMPUTER_USE_STRICT_AX");
 	const appleScriptEnabled = parseBoolean(process.env.PI_COMPUTER_USE_APPLE_SCRIPT);
 	if (appleScriptEnabled !== undefined) {
 		out.apple_script = { ...DEFAULT_APPLE_SCRIPT_CONFIG, enabled: appleScriptEnabled };
@@ -198,10 +205,6 @@ export function getComputerUseConfig(): ComputerUseConfig {
 
 export function getLoadedComputerUseConfig(): LoadedComputerUseConfig {
 	return activeLoadedConfig;
-}
-
-export function isStrictAxMode(): boolean {
-	return activeConfig.stealth_mode;
 }
 
 export function isFocusAutoApprove(): boolean {
@@ -252,7 +255,6 @@ export function saveUserComputerUseConfig(update: Partial<ComputerUseConfig>): s
 	const flatExisting = existing.computer_use && typeof existing.computer_use === "object" ? existing.computer_use : existing;
 	const merged: any = { ...flatExisting };
 	if (update.browser_use !== undefined) merged.browser_use = update.browser_use;
-	if (update.stealth_mode !== undefined) merged.stealth_mode = update.stealth_mode;
 	if (update.focus_auto_approve !== undefined) merged.focus_auto_approve = update.focus_auto_approve;
 	if (update.apple_script !== undefined) {
 		merged.apple_script = {
