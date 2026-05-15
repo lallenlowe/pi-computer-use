@@ -317,8 +317,10 @@ async function main(): Promise<number> {
 		executeTypeText("tt", { text: "hello", image: "never" }, undefined, undefined, ctx),
 	);
 
-	// 7. keypress with no AX semantic equivalent - must be blocked
-	await runCase("keypress.fallback", "strict_mode_block", () =>
+	// 7. keypress with no AX semantic equivalent - delivered via per-PID event
+	//    posting, which doesn't move the system cursor or change frontmost.
+	//    Stealth-safe by mechanism. We just assert frontmost doesn't drift.
+	await runCase("keypress.fallback", "ax_success", () =>
 		executeKeypress("kp", { keys: ["F12"], image: "never" }, undefined, undefined, ctx),
 	);
 

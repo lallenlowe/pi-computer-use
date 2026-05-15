@@ -152,6 +152,7 @@ interface ExecutionTrace {
 		| "browser_open_location"
 		| "ax_set_value"
 		| "raw_keypress"
+		| "per_pid_keypress"
 		| "raw_key_text";
 	axAttempted?: boolean;
 	axSucceeded?: boolean;
@@ -621,8 +622,11 @@ function executionTrace(
 	};
 }
 
-function strictModeBlock(message: string): never {
-	throw new Error(`${message} Stealth/strict AX mode is enabled, so non-AX, foreground-focus, and cursor fallbacks are blocked.`);
+function strictModeBlock(message: string, alternative?: string): never {
+	const altClause = alternative ? ` Try instead: ${alternative}` : "";
+	throw new Error(
+		`${message} Stealth/strict AX mode is enabled, so non-AX, foreground-focus, and cursor fallbacks are blocked.${altClause}`,
+	);
 }
 
 function settleMsForExecution(execution: ExecutionTrace): number {
@@ -2415,7 +2419,10 @@ async function dispatchClick(
 
 	if (!clickedViaAX && !focusedViaAX) {
 		if (isStrictAxMode()) {
-			strictModeBlock(`AX click/focus could not be completed at (${Math.round(x)},${Math.round(y)}).`);
+			strictModeBlock(
+				`AX click/focus could not be completed at (${Math.round(x)},${Math.round(y)}).`,
+				"call screenshot to refresh AX targets, then click({ ref }) on the matching @eN — coordinate clicks only succeed in stealth when an AX element is grounded under the point",
+			);
 		}
 		await bridgeCommand(
 			"mouseClick",
@@ -2458,7 +2465,10 @@ async function dispatchTypeText(text: string, target: ResolvedTarget, signal?: A
 		}
 	}
 	if (isStrictAxMode()) {
-		strictModeBlock("Raw text insertion is not AX-only. Use set_text for AX value replacement.");
+		strictModeBlock(
+			"Raw text insertion is not AX-only.",
+			"set_text({ ref, text }) on a text AX target from the latest screenshot replaces the value via AX without requiring keyboard focus",
+		);
 	}
 	await focusControlledWindow(target, signal);
 	await bridgeCommand(
@@ -2531,7 +2541,10 @@ async function dispatchSetText(params: SetTextParams, target: ResolvedTarget, si
 		}
 
 		if (isStrictAxMode()) {
-			strictModeBlock(`AX target '${ref}' does not expose a directly settable AX value.`);
+			strictModeBlock(
+				`AX target '${ref}' does not expose a directly settable AX value.`,
+				"pick a different ref from the latest screenshot whose actions list includes setValue, or click({ ref }) the field first to focus it and try again",
+			);
 		}
 
 		let focusedViaRef = await focusAxElement(axTarget.elementRef, target, signal);
@@ -2562,7 +2575,10 @@ async function dispatchSetText(params: SetTextParams, target: ResolvedTarget, si
 	}
 
 	if (isStrictAxMode()) {
-		strictModeBlock("set_text in stealth mode requires a text AX ref from the latest screenshot or an already-focused text control.");
+		strictModeBlock(
+			"set_text in stealth mode requires a text AX ref from the latest screenshot or an already-focused text control.",
+			"call screenshot to refresh AX targets, then set_text({ ref, text }) using a ref whose role is AXTextField/AXTextArea/AXSearchField/AXComboBox",
+		);
 	}
 
 	await focusControlledWindow(target, signal);
@@ -2712,8 +2728,25 @@ async function dispatchKeypress(params: KeypressParams, target: ResolvedTarget, 
 		return executionTrace("ax_action", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
+	// Stealth keypress path: events are delivered via event.postToPid(pid) on
+	// the helper side, NOT via the global CGEventPost session tap. postToPid
+	// goes to the target app's event queue and does not move the system cursor
+	// or change the frontmost app. That's mechanically stealth-safe — the
+	// same primitive OpenAI's Sky CUA helper uses for the same reason.
+	//
+	// We deliberately skip focusControlledWindow() here in stealth mode: that
+	// call would raise the target window above the user's frontmost (a real
+	// stealth-contract violation). The trade-off is keypress becomes
+	// best-effort for apps that gate input on foreground status. Empirically
+	// Slack/Electron, Chrome, and most modern apps accept postToPid events
+	// without being foreground; some legacy AppKit apps may not.
 	if (isStrictAxMode()) {
-		strictModeBlock("Keypress is not AX-only and no semantic AX equivalent was available.");
+		await bridgeCommand("keyPress", { keys, pid: target.pid }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
+		return executionTrace("per_pid_keypress", "stealth", {
+			axAttempted: semanticActionsForKeys(keys).length > 0,
+			axSucceeded: false,
+			fallbackUsed: semanticActionsForKeys(keys).length > 0,
+		});
 	}
 	await focusControlledWindow(target, signal);
 	await bridgeCommand("keyPress", { keys, pid: target.pid }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
@@ -2807,7 +2840,10 @@ async function dispatchScroll(
 
 	const reasonText = scrollAttempt.reason ? ` Reason: ${scrollAttempt.reason}.` : "";
 	if (isStrictAxMode()) {
-		strictModeBlock(ref ? `AX scroll could not be completed for ${ref}.${reasonText}` : `AX scroll could not be completed at (${Math.round(x)},${Math.round(y)}).${reasonText}`);
+		strictModeBlock(
+			ref ? `AX scroll could not be completed for ${ref}.${reasonText}` : `AX scroll could not be completed at (${Math.round(x)},${Math.round(y)}).${reasonText}`,
+			"refresh the screenshot and look for an AX target whose actions include scroll (typically AXScrollArea); pass that ref to scroll({ ref, scrollY })",
+		);
 	}
 	if (!Number.isFinite(x) || !Number.isFinite(y)) {
 		throw new Error(`Coordinate scroll fallback requires x and y.${reasonText} Provide coordinates from the latest screenshot or use a current AX scroll target.`);
@@ -2841,7 +2877,10 @@ async function dispatchMoveMouse(
 	signal?: AbortSignal,
 ): Promise<ExecutionTrace> {
 	if (isStrictAxMode()) {
-		strictModeBlock("Mouse movement is not AX-only.");
+		strictModeBlock(
+			"Mouse movement is not AX-only and would warp the user's cursor.",
+			"there's no AX equivalent for hover; if you need to trigger a hover-revealed UI, click({ ref }) on the underlying control instead, or ask the user to enable hover manually",
+		);
 	}
 	const x = toFiniteNumber(params.x, NaN);
 	const y = toFiniteNumber(params.y, NaN);
@@ -2910,7 +2949,12 @@ async function dispatchDrag(
 		return executionTrace("ax_action", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 	if (isStrictAxMode()) {
-		strictModeBlock(ref ? `AX adjustment could not be completed for ${ref}.` : "Drag is not AX-only.");
+		strictModeBlock(
+			ref ? `AX adjustment could not be completed for ${ref}.` : "Drag is not AX-only.",
+			ref
+				? "the ref's role may not support increment/decrement — pick an AXSlider/AXScrollBar from the screenshot, or use scroll({ ref }) for content panes"
+				: "there's no AX equivalent for arbitrary dragging; if the goal is reordering or selection, look for app-specific buttons in the screenshot, or ask the user",
+		);
 	}
 	if (!path) {
 		throw new Error("drag requires path points for pointer fallback or a ref plus path for AX adjustment.");

@@ -963,9 +963,102 @@ final class Bridge {
 			if let existing = bestByKey[key], existing.1 >= score { continue }
 			bestByKey[key] = (candidate, score)
 		}
+		// Currently-focused element pre-pass. The model's mental model is "I just
+		// focused this control, now I want to act on it." If the focused element
+		// is a text input within this window's subtree, surface it unconditionally
+		// with a high score so it ranks above generic chrome. This handles the
+		// case where focus moved during a prior tool call but the element sits
+		// below the depth or scoring cutoff (a real risk in deep hybrid trees).
+		var focusedTextSurfaced = false
+		let appElement = AXUIElementCreateApplication(pid)
+		if let focused = copyAttribute(appElement, attribute: kAXFocusedUIElementAttribute as CFString).flatMap(asAXElement),
+			isElement(focused, descendantOf: window)
+		{
+			let role = self.stringAttribute(focused, attribute: kAXRoleAttribute as CFString) ?? ""
+			if textRoles.contains(role) {
+				var valueSettable = DarwinBoolean(false)
+				let valueStatus = AXUIElementIsAttributeSettable(focused, kAXValueAttribute as CFString, &valueSettable)
+				let canSetValue = valueStatus == .success && valueSettable.boolValue
+				if let frame = self.frameForElement(focused), frame.width > 10, frame.height > 10 {
+					let title = self.stringAttribute(focused, attribute: kAXTitleAttribute as CFString) ?? ""
+					let description = self.stringAttribute(focused, attribute: kAXDescriptionAttribute as CFString) ?? ""
+					let value = self.stringAttribute(focused, attribute: kAXValueAttribute as CFString) ?? ""
+					let label = [title, description, value].first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? ""
+					let normalizedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+					// Score above the rescue-pass baseline so the focused control wins.
+					var score = 600.0
+					score += self.scoreTextInputElement(focused, role: role)
+					if canSetValue { score += 160 }
+					if !normalizedLabel.isEmpty { score += 55 }
+					let key = "\(role)|\(normalizedLabel)|\(Int(frame.midX / 24))|\(Int(frame.midY / 24))"
+					bestByKey[key] = (focused, score)
+					focusedTextSurfaced = true
+				}
+			}
+		}
+
+		// Hybrid text-input rescue pass. Hybrid apps (Electron / Catalyst-with-web)
+		// often host their composer/text-area deeper than the bounded BFS reaches.
+		// If the bounded walk yielded zero text-input candidates AND the window is
+		// hybrid, walk deeper but only collect text-input roles. This keeps native
+		// apps free from the cost (their walk is already complete) and only pays
+		// the deeper traversal when we'd otherwise return a useless result.
+		var rescuePassRan = false
+		var rescuedTextInputCount = 0
+		let bestHasTextInput = bestByKey.values.contains { tup in
+			let role = self.stringAttribute(tup.0, attribute: kAXRoleAttribute as CFString) ?? ""
+			return textRoles.contains(role)
+		}
+		if isHybrid && !bestHasTextInput {
+			rescuePassRan = true
+			let rescued = collectDescendantsMatching(
+				startingAt: window,
+				maxDepth: 30,
+				maxNodes: 5000,
+				where: { element in
+					let role = self.stringAttribute(element, attribute: kAXRoleAttribute as CFString) ?? ""
+					return textRoles.contains(role)
+				}
+			)
+			for candidate in rescued {
+				let role = self.stringAttribute(candidate, attribute: kAXRoleAttribute as CFString) ?? ""
+				let title = self.stringAttribute(candidate, attribute: kAXTitleAttribute as CFString) ?? ""
+				let description = self.stringAttribute(candidate, attribute: kAXDescriptionAttribute as CFString) ?? ""
+				let value = self.stringAttribute(candidate, attribute: kAXValueAttribute as CFString) ?? ""
+				var valueSettable = DarwinBoolean(false)
+				let valueStatus = AXUIElementIsAttributeSettable(candidate, kAXValueAttribute as CFString, &valueSettable)
+				let canSetValue = valueStatus == .success && valueSettable.boolValue
+				var focusedSettable = DarwinBoolean(false)
+				let focusStatus = AXUIElementIsAttributeSettable(candidate, kAXFocusedAttribute as CFString, &focusedSettable)
+				let canFocus = focusStatus == .success && focusedSettable.boolValue
+				// Skip dead text inputs — if we can't set or focus, they're not
+				// actionable anyway and would just clutter the result.
+				if !(canSetValue || canFocus) { continue }
+				guard let frame = self.frameForElement(candidate), frame.width > 10, frame.height > 10 else { continue }
+				// Same large-area sanity guard as the main pass.
+				if (role == "AXTextArea" || role == "AXTextView") && frame.width * frame.height > windowArea * 0.55 && !canSetValue { continue }
+				let label = [title, description, value].first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? ""
+				let normalizedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+				// Score with a high baseline — a stealth-only model needs the composer
+				// to surface above generic chrome buttons. Text inputs are precious in
+				// hybrid apps; if we found one this deep, the user almost certainly
+				// wants to interact with it.
+				var score = 480.0
+				score += self.scoreTextInputElement(candidate, role: role)
+				if canSetValue { score += 160 }
+				if canFocus { score += 40 }
+				if !normalizedLabel.isEmpty { score += 55 }
+				if !description.isEmpty { score += 18 }
+				let key = "\(role)|\(normalizedLabel)|\(Int(frame.midX / 24))|\(Int(frame.midY / 24))"
+				if let existing = bestByKey[key], existing.1 >= score { continue }
+				bestByKey[key] = (candidate, score)
+				rescuedTextInputCount += 1
+			}
+		}
+
 		let ranked = bestByKey.values.sorted { $0.1 > $1.1 }
 		let topRoles = roleCounts.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }.prefix(16)
-		let diagnostics: [String: Any] = [
+		var diagnostics: [String: Any] = [
 			"axTreeNodeCount": elements.count,
 			"visibleInteractiveNodeCount": visibleFrameCount,
 			"eligibleNodeCount": eligibleCount,
@@ -974,6 +1067,15 @@ final class Bridge {
 			"roleCounts": Dictionary(uniqueKeysWithValues: topRoles.map { ($0.key, $0.value) }),
 			"rejectedByReason": rejectedByReason,
 		]
+		if rescuePassRan {
+			diagnostics["hybridTextInputRescue"] = [
+				"ran": true,
+				"recoveredCount": rescuedTextInputCount,
+			]
+		}
+		if focusedTextSurfaced {
+			diagnostics["focusedTextSurfaced"] = true
+		}
 		return ["targets": Array(ranked.prefix(limit)).map { self.elementPayload(element: $0.0, key: "target", score: $0.1) }, "diagnostics": diagnostics]
 	}
 
@@ -1225,6 +1327,35 @@ final class Bridge {
 			let (element, depth) = queue[index]
 			index += 1
 			output.append(element)
+			if depth >= maxDepth { continue }
+			let children = axElementArray(element, attribute: kAXChildrenAttribute as CFString)
+			for child in children {
+				queue.append((child, depth + 1))
+			}
+		}
+		return output
+	}
+
+	/// BFS variant that walks deep but only retains nodes matching `where`. Used
+	/// for targeted second-pass rescues (e.g. hybrid app text inputs hosted
+	/// inside an AXWebArea well below the bounded walk's depth cap). Walk depth
+	/// is capped by `maxDepth`; total nodes visited is capped by `maxNodes`.
+	private func collectDescendantsMatching(
+		startingAt root: AXUIElement,
+		maxDepth: Int,
+		maxNodes: Int = 5000,
+		where predicate: (AXUIElement) -> Bool
+	) -> [AXUIElement] {
+		var queue: [(AXUIElement, Int)] = [(root, 0)]
+		var index = 0
+		var visited = 0
+		var output: [AXUIElement] = []
+		while index < queue.count {
+			if visited >= maxNodes { break }
+			let (element, depth) = queue[index]
+			index += 1
+			visited += 1
+			if predicate(element) { output.append(element) }
 			if depth >= maxDepth { continue }
 			let children = axElementArray(element, attribute: kAXChildrenAttribute as CFString)
 			for child in children {
