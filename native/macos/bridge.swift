@@ -1888,7 +1888,7 @@ final class Bridge {
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 		let button = mouseButton(optionalStringArg(request, "button") ?? "left")
 		let clickCount = max(1, min(3, optionalIntArg(request, "clickCount") ?? 1))
-		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		try postMouseClick(at: point, pid: targetPid, button: button, clickCount: clickCount)
 		return ["clicked": true]
 	}
@@ -1902,7 +1902,7 @@ final class Bridge {
 		}
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
-		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		try postMouseMove(to: point, pid: targetPid)
 		return ["moved": true]
 	}
@@ -1917,13 +1917,14 @@ final class Bridge {
 		}
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
+		let frame = windowFrameArg(request)
 		let points = try rawPath.map { rawPoint -> CGPoint in
 			guard let x = (rawPoint["x"] as? NSNumber)?.doubleValue,
 				let y = (rawPoint["y"] as? NSNumber)?.doubleValue
 			else {
 				throw BridgeFailure(message: "mouseDrag path entries must include numeric x and y", code: "invalid_args")
 			}
-			return try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+			return try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: frame)
 		}
 		try postMouseDrag(points: points, pid: targetPid)
 		return ["dragged": true]
@@ -1940,7 +1941,7 @@ final class Bridge {
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 		let scrollX = optionalIntArg(request, "scrollX") ?? 0
 		let scrollY = optionalIntArg(request, "scrollY") ?? 0
-		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		try postScrollWheel(at: point, deltaX: scrollX, deltaY: scrollY, pid: targetPid)
 		return ["scrolled": true]
 	}
@@ -1966,7 +1967,7 @@ final class Bridge {
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 
-		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
 		OverlayController.shared.triggerClickRing(globalPoint: point, button: .left, ownerPid: targetPid)
 		guard let hitElement = hitTestElement(at: point) else {
@@ -2317,7 +2318,7 @@ final class Bridge {
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 
-		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["focused": false, "reason": "hit_test_failed"]
@@ -2347,7 +2348,7 @@ final class Bridge {
 		}
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
-		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["scrolled": false, "reason": "hit_test_failed"]
@@ -3115,6 +3116,17 @@ final class Bridge {
 				if #available(macOS 14.0, *) {
 					config.ignoreShadowsSingleWindow = true
 				}
+				// Default SCStreamConfiguration width/height is 0, which
+				// SCScreenshotManager interprets as the full display - so
+				// without this we capture a 1920x1080 image with the
+				// window as a small region inside a transparent frame.
+				// Set the pixel dimensions to the window's logical size
+				// times the display backing scale so the image matches the
+				// window exactly. This makes the image: pixel = window: point
+				// relationship clean and the scale field meaningful.
+				let wScale = displayScaleFactor(for: window.frame)
+				config.width = max(1, Int((window.frame.width * wScale).rounded()))
+				config.height = max(1, Int((window.frame.height * wScale).rounded()))
 
 				let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
 				capturedImage.value = image
@@ -3165,15 +3177,32 @@ final class Bridge {
 			throw BridgeFailure(message: "Failed to encode screenshot as PNG", code: "encoding_failed")
 		}
 
-		let bounds = currentWindowBounds(windowId: windowId)
-		let scale = bounds.map { displayScaleFactor(for: $0) } ?? 1.0
+		// Derive scaleFactor by comparing the actual captured image's pixel
+		// dimensions to the window's logical-point frame. The previous
+		// implementation called currentWindowBounds (SCK with 2s timeout),
+		// which returns nil when SCK is slow or the window is off-Space,
+		// silently falling back to scale=1 even on retina displays. Using
+		// the image we just captured + the cached AX frame is reliable and
+		// avoids an extra round-trip.
+		var scale: Double = Double(NSScreen.main?.backingScaleFactor ?? 1.0)
+		var windowSize: CGSize? = nil
+		if let bounds = currentWindowBounds(windowId: windowId), bounds.size.height > 0 {
+			let derived = Double(image.height) / Double(bounds.size.height)
+			if derived > 0.5 { scale = derived }
+			windowSize = bounds.size
+		}
 
-		return [
+		var payload: [String: Any] = [
 			"pngBase64": pngData.base64EncodedString(),
 			"width": image.width,
 			"height": image.height,
 			"scaleFactor": scale,
 		]
+		if let windowSize {
+			payload["windowWidth"] = windowSize.width
+			payload["windowHeight"] = windowSize.height
+		}
+		return payload
 	}
 
 	private func cgWindowScreenshot(windowId: UInt32) throws -> [String: Any]? {
@@ -3250,22 +3279,64 @@ final class Bridge {
 		return output.value
 	}
 
+	/// Map a window-relative LOGICAL POINT to a global screen point.
+	///
+	/// Coordinates contract (v3): callers pass `x`, `y` in window-relative
+	/// logical points - the same units as `framePoints.w`/`framePoints.h`
+	/// returned by `listWindows`. NOT image pixels. On retina displays the
+	/// screenshot image is captured at the display's backing scale
+	/// (typically 2x), but coordinates are always logical points.
+	///
+	/// Caller may pass `windowFramePoints: {x,y,w,h}` (logical points) so
+	/// we don't need a fresh SCK lookup per click. Falls back to
+	/// `currentWindowBounds(windowId)` for backward compat with older TS
+	/// callers; that path can be removed once all sites pass the frame.
+	///
+	/// `captureWidth`/`captureHeight` are accepted but IGNORED in v3 -
+	/// they were the proportional-mapping denominator under the old
+	/// (broken) image-pixel contract. Kept for request-shape compat.
 	private func mapWindowPoint(
 		windowId: UInt32,
 		x: Double,
 		y: Double,
 		captureWidth: Double,
-		captureHeight: Double
+		captureHeight: Double,
+		windowFrame: CGRect? = nil
 	) throws -> CGPoint {
-		guard let bounds = currentWindowBounds(windowId: windowId) else {
+		_ = captureWidth
+		_ = captureHeight
+		let bounds: CGRect
+		if let windowFrame {
+			bounds = windowFrame
+		} else if let live = currentWindowBounds(windowId: windowId) {
+			bounds = live
+		} else {
 			throw BridgeFailure(message: "Target window is no longer available", code: "window_not_found")
 		}
 
-		let relX = min(max(x / captureWidth, 0), 1)
-		let relY = min(max(y / captureHeight, 0), 1)
-		let screenX = bounds.origin.x + bounds.size.width * relX
-		let screenY = bounds.origin.y + bounds.size.height * relY
+		if x < 0 || y < 0 || x > bounds.size.width || y > bounds.size.height {
+			throw BridgeFailure(
+				message: "Coordinates (\(Int(x.rounded())),\(Int(y.rounded()))) are outside the window frame (\(Int(bounds.size.width.rounded()))x\(Int(bounds.size.height.rounded())) logical points). Coordinates are window-relative LOGICAL POINTS, not image pixels - on retina displays the screenshot image is ~2x the window's logical size, so divide image-pixel measurements by the scale (see screenshot envelope's capture.scale field) before passing them to click/move_mouse/drag/scroll.",
+				code: "coords_out_of_frame"
+			)
+		}
+
+		let screenX = bounds.origin.x + x
+		let screenY = bounds.origin.y + y
 		return CGPoint(x: screenX, y: screenY)
+	}
+
+	/// Parse an optional `windowFramePoints: {x,y,w,h}` argument from a
+	/// request. Returns nil if absent or invalid; callers fall through to
+	/// the slower SCK lookup in that case.
+	private func windowFrameArg(_ request: [String: Any]) -> CGRect? {
+		guard let dict = request["windowFramePoints"] as? [String: Any] else { return nil }
+		let x = (dict["x"] as? NSNumber)?.doubleValue ?? 0
+		let y = (dict["y"] as? NSNumber)?.doubleValue ?? 0
+		let w = (dict["w"] as? NSNumber)?.doubleValue ?? 0
+		let h = (dict["h"] as? NSNumber)?.doubleValue ?? 0
+		guard w > 0, h > 0 else { return nil }
+		return CGRect(x: x, y: y, width: w, height: h)
 	}
 
 	private func postEvent(_ event: CGEvent, pid: Int32) {
