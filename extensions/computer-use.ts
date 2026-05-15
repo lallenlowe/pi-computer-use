@@ -615,12 +615,6 @@ async function openSettingsTUI(ctx: { ui: any; cwd: string }): Promise<void> {
 			values: ["on", "off"],
 		},
 		{
-			id: "stealth_mode",
-			label: "stealth_mode (don't steal foreground or warp cursor)",
-			currentValue: onOff(current.stealth_mode),
-			values: ["on", "off"],
-		},
-		{
 			id: "focus_auto_approve",
 			label: "focus_auto_approve (skip ctx.ui.confirm for surface_window / launch_app activate=true)",
 			currentValue: onOff(current.focus_auto_approve),
@@ -713,9 +707,6 @@ function applySettingChange(ctx: { cwd: string }, id: string, newValue: string):
 		case "browser_use":
 			saveUserComputerUseConfig({ browser_use: boolValue });
 			break;
-		case "stealth_mode":
-			saveUserComputerUseConfig({ stealth_mode: boolValue });
-			break;
 		case "focus_auto_approve":
 			saveUserComputerUseConfig({ focus_auto_approve: boolValue });
 			break;
@@ -769,7 +760,6 @@ function formatConfigStatus(): string {
 		"pi-computer-use config",
 		"",
 		`browser_use: ${loaded.config.browser_use ? "enabled" : "disabled"}`,
-		`stealth_mode: ${loaded.config.stealth_mode ? "enabled" : "disabled"}`,
 		`focus_auto_approve: ${loaded.config.focus_auto_approve ? "enabled" : "disabled"}`,
 		`apple_script: ${loaded.config.apple_script.enabled ? "enabled" : "disabled"} (restore_frontmost_on_drift=${loaded.config.apple_script.restore_frontmost_on_drift}, timeout_ms=${loaded.config.apple_script.timeout_ms})`,
 		`overlay: ${loaded.config.overlay.enabled ? "enabled" : "disabled"} (size=${loaded.config.overlay.size}, animation=${loaded.config.overlay.animation_style}@${loaded.config.overlay.animation_duration_ms}ms, occlusion_aware=${loaded.config.overlay.occlusion_aware})`,

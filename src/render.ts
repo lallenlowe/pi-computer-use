@@ -253,9 +253,6 @@ function toolSummary(
 			const d = details as ComputerUseDetails;
 			const parts: string[] = [];
 			if (d.execution?.strategy) parts.push(d.execution.strategy);
-			if (d.execution?.variant && d.execution.variant !== "default") {
-				parts.push(d.execution.variant);
-			}
 			if (toolName === "screenshot" && Array.isArray(d.axTargets)) {
 				parts.push(`${d.axTargets.length} targets`);
 			}
