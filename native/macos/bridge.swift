@@ -1093,6 +1093,8 @@ final class Bridge {
 			return listApps()
 		case "listWindows":
 			return try listWindows(pid: Int32(try intArg(request, "pid")))
+		case "wakeWindow":
+			return try wakeWindow(request)
 		case "getFrontmost":
 			return try getFrontmost()
 		case "getUserContext":
@@ -1503,15 +1505,32 @@ final class Bridge {
 				usedIds.insert(candidate.windowId)
 			}
 
-			let effectiveFrame = axFrame.width > 1 && axFrame.height > 1 ? axFrame : (candidate?.bounds ?? axFrame)
-			if effectiveFrame.width < 100 || effectiveFrame.height < 80 { continue }
 			let hasUsableAXFrame = axFrame.width > 1 && axFrame.height > 1
+			let effectiveFrame = hasUsableAXFrame ? axFrame : (candidate?.bounds ?? axFrame)
+
+			// Off-Space windows often have a zeroed AX frame because the
+			// window isn't being rendered, but they still appear in
+			// CGWindowList with their last-known bounds. Don't drop them on
+			// the size filter just because AX is being unhelpful - the agent
+			// can still drive them via AX actions, and the windowId lets us
+			// `wake_window` them back to the active Space when needed.
+			let axIsOffSpace = !hasUsableAXFrame && candidate != nil && !(candidate!.isOnscreen)
+			if !axIsOffSpace {
+				if effectiveFrame.width < 100 || effectiveFrame.height < 80 { continue }
+			}
+
 			let title = hasUsableAXFrame && !axTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? axTitle : (candidate?.title.isEmpty == false ? candidate!.title : axTitle)
 			let windowRef = refStore.storeWindow(window)
 			let isMinimized = boolAttribute(window, attribute: kAXMinimizedAttribute as CFString) ?? false
 			let isMain = boolAttribute(window, attribute: kAXMainAttribute as CFString) ?? false
 			let isFocused = boolAttribute(window, attribute: kAXFocusedAttribute as CFString) ?? false
 			let scale = displayScaleFactor(for: effectiveFrame)
+			let isOnscreen = candidate?.isOnscreen ?? !isMinimized
+			// Active Space heuristic: if the window is unminimized but
+			// CGWindowList says it's not on-screen, it's almost certainly
+			// on another Space. Minimized windows are a separate case the
+			// caller can detect via isMinimized.
+			let isOnActiveSpace = isMinimized || isOnscreen
 
 			var item: [String: Any] = [
 				"windowRef": windowRef,
@@ -1524,7 +1543,8 @@ final class Bridge {
 				],
 				"scaleFactor": scale,
 				"isMinimized": isMinimized,
-				"isOnscreen": candidate?.isOnscreen ?? !isMinimized,
+				"isOnscreen": isOnscreen,
+				"isOnActiveSpace": isOnActiveSpace,
 				"isMain": isMain,
 				"isFocused": isFocused,
 			]
@@ -1534,6 +1554,75 @@ final class Bridge {
 			output.append(item)
 		}
 		return output
+	}
+
+	/// Bring a window to the active Space and raise it without changing
+	/// the user's frontmost app. We use NSRunningApplication's activate
+	/// without options for a polite raise, then AXRaiseAction on the
+	/// window itself which is what asks the WindowServer to drag the
+	/// window onto the current Space. Per-PID delivery, so the raise
+	/// doesn't ripple through to other apps.
+	private func wakeWindow(_ request: [String: Any]) throws -> [String: Any] {
+		let windowRef = optionalStringArg(request, "windowRef")
+		let windowIdArg = optionalIntArg(request, "windowId")
+		let pidArg = optionalIntArg(request, "pid").map { Int32($0) }
+
+		var targetPid: Int32? = pidArg
+		var axWindow: AXUIElement? = nil
+		if let windowRef = windowRef, let element = refStore.window(for: windowRef) {
+			axWindow = element
+			var pidOut: pid_t = 0
+			if AXUIElementGetPid(element, &pidOut) == .success, pidOut > 0 {
+				targetPid = pidOut
+			}
+		} else if let windowId = windowIdArg, let pid = targetPid {
+			// No live AX ref. Walk the app's AX windows and find the one
+			// matching the CGWindowList candidate by windowId.
+			let appElement = AXUIElementCreateApplication(pid)
+			AXUIElementSetMessagingTimeout(appElement, 1.0)
+			let windows = axElementArray(appElement, attribute: kAXWindowsAttribute as CFString)
+			let candidates = cgWindowCandidates(pid: pid)
+			var usedIds = Set<UInt32>()
+			for window in windows {
+				let axTitle = stringAttribute(window, attribute: kAXTitleAttribute as CFString) ?? ""
+				let axFrame = frameForWindow(window)
+				let candidate = bestCandidate(frame: axFrame, title: axTitle, candidates: candidates, usedIds: usedIds)
+				if let candidate { usedIds.insert(candidate.windowId) }
+				if candidate?.windowId == UInt32(windowId) {
+					axWindow = window
+					break
+				}
+			}
+		}
+
+		guard let pid = targetPid else {
+			throw BridgeFailure(message: "wakeWindow requires either a windowRef or both windowId and pid", code: "invalid_args")
+		}
+
+		// Polite raise: brings the app's windows back to the active Space
+		// without making it frontmost system-wide if we don't pass
+		// .activateAllWindows / .activateIgnoringOtherApps. The window
+		// becomes visible on the current Space; user's focus is preserved.
+		var appActivated = false
+		if let runningApp = NSRunningApplication(processIdentifier: pid) {
+			appActivated = runningApp.activate(options: [])
+		}
+
+		var windowRaised = false
+		if let axWindow = axWindow {
+			// AXRaiseAction is the AX equivalent of clicking the window's
+			// title bar - it pulls the window to the current Space and
+			// makes it the app's main window without forcing the app to
+			// become frontmost.
+			let status = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+			windowRaised = (status == .success)
+		}
+
+		return [
+			"appActivated": appActivated,
+			"windowRaised": windowRaised,
+			"pid": Int(pid),
+		]
 	}
 
 	private func screenshot(_ request: [String: Any]) throws -> [String: Any] {

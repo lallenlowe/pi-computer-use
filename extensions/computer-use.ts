@@ -13,6 +13,7 @@ import {
 	executeKeypress,
 	executeListApps,
 	executeListWindows,
+	executeWakeWindow,
 	executeMoveMouse,
 	executeNavigateBrowser,
 	executeScroll,
@@ -29,6 +30,7 @@ import {
 	type DragParams,
 	type KeypressParams,
 	type ListWindowsParams,
+	type WakeWindowParams,
 	type MoveMouseParams,
 	type NavigateBrowserParams,
 	type ScreenshotParams,
@@ -107,6 +109,28 @@ const listWindowsTool = defineTool(withCompactRendering({
 	}),
 	async execute(toolCallId, params: ListWindowsParams, signal, onUpdate, ctx) {
 		return await executeListWindows(toolCallId, params, signal, onUpdate, ctx);
+	},
+}));
+
+const wakeWindowTool = defineTool(withCompactRendering({
+	name: "wake_window",
+	label: "Wake Window",
+	description: "Bring a window from another macOS Space to the active Space without changing the user's frontmost app. Use after list_windows reports off_active_space.",
+	promptSnippet: "Pull a controllable window onto the current Space when list_windows reports it as off_active_space.",
+	promptGuidelines: [
+		"Use this only when list_windows or a screenshot error indicates the target window is on another Space.",
+		"Pass the @wN windowRef returned by list_windows; falling back to {windowId, pid} also works for non-stored refs.",
+		"After wake_window succeeds, call screenshot({ window: '@wN' }) to inspect and target the window.",
+		"This raises the window onto the current Space but does not steal foreground from the user's current app.",
+	],
+	executionMode: "sequential",
+	parameters: Type.Object({
+		windowRef: Type.Optional(Type.String({ description: "Window ref like @w1 returned by list_windows or screenshot." })),
+		windowId: Type.Optional(Type.Number({ description: "CGWindowID for the target window. Required when windowRef is omitted; must be paired with pid." })),
+		pid: Type.Optional(Type.Number({ description: "Process ID owning the window. Required when windowRef is omitted." })),
+	}),
+	async execute(toolCallId, params: WakeWindowParams, signal, onUpdate, ctx) {
+		return await executeWakeWindow(toolCallId, params, signal, onUpdate, ctx);
 	},
 }));
 
@@ -734,6 +758,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 	try {
 		pi.registerTool(listAppsTool);
 		pi.registerTool(listWindowsTool);
+		pi.registerTool(wakeWindowTool);
 		pi.registerTool(screenshotTool);
 		pi.registerTool(clickTool);
 		pi.registerTool(doubleClickTool);

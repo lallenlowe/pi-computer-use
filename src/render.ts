@@ -28,9 +28,10 @@ import type {
 	ComputerUseDetails,
 	ListAppsDetails,
 	ListWindowsDetails,
+	WakeWindowDetails,
 } from "../src/bridge.ts";
 
-type AnyDetails = ComputerUseDetails | ListAppsDetails | ListWindowsDetails | AppleScriptDetails | undefined;
+type AnyDetails = ComputerUseDetails | ListAppsDetails | ListWindowsDetails | WakeWindowDetails | AppleScriptDetails | undefined;
 
 interface ThemeLike {
 	bold: (s: string) => string;
@@ -168,6 +169,10 @@ function appOrTargetTag(toolName: string, details: AnyDetails): string | undefin
 			return undefined;
 		case "list_windows":
 			return undefined;
+		case "wake_window": {
+			const d = details as WakeWindowDetails;
+			return d.window?.appName;
+		}
 		case "apple_script": {
 			const d = details as AppleScriptDetails;
 			return d.app;
@@ -197,7 +202,17 @@ function toolSummary(
 		}
 		case "list_windows": {
 			const d = details as ListWindowsDetails;
-			return `${d.windows.length} windows`;
+			const offSpace = d.windows.filter((w) => !w.isOnActiveSpace && !w.isMinimized).length;
+			const offSpaceTag = offSpace > 0 ? `, ${offSpace} off-Space` : "";
+			return `${d.windows.length} windows${offSpaceTag}`;
+		}
+		case "wake_window": {
+			const d = details as WakeWindowDetails;
+			const bits: string[] = [];
+			if (d.appActivated) bits.push("app activated");
+			if (d.windowRaised) bits.push("window raised");
+			if (!bits.length) bits.push("no-op");
+			return bits.join(" \u00b7 ");
 		}
 		case "apple_script": {
 			const d = details as AppleScriptDetails;

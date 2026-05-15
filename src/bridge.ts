@@ -33,6 +33,26 @@ export interface ListWindowsParams {
 	pid?: number;
 }
 
+export interface WakeWindowParams {
+	windowRef?: string;
+	windowId?: number;
+	pid?: number;
+}
+
+export interface WakeWindowDetails {
+	tool: "wake_window";
+	query: WakeWindowParams;
+	appActivated: boolean;
+	windowRaised: boolean;
+	pid: number;
+	window: {
+		windowRef?: string;
+		windowId?: number;
+		windowTitle?: string;
+		appName?: string;
+	};
+}
+
 interface WindowTargetParams {
 	window?: WindowSelector;
 	stateId?: string;
@@ -260,6 +280,7 @@ export interface ListWindowsDetails {
 		scaleFactor: number;
 		isMinimized: boolean;
 		isOnscreen: boolean;
+		isOnActiveSpace: boolean;
 		isMain: boolean;
 		isFocused: boolean;
 		browserUseAllowed: boolean;
@@ -293,6 +314,12 @@ interface HelperWindow {
 	scaleFactor: number;
 	isMinimized: boolean;
 	isOnscreen: boolean;
+	// True when the window is on the user's currently visible Space
+	// (or minimized, which is a separate user-resolvable state).
+	// False when the window exists and the app is running but the
+	// window has been moved to another Space - the window is still
+	// AX-addressable but won't render until raised.
+	isOnActiveSpace: boolean;
 	isMain: boolean;
 	isFocused: boolean;
 }
@@ -371,6 +398,7 @@ interface ResolvedTarget extends CurrentTarget {
 	scaleFactor: number;
 	isMinimized: boolean;
 	isOnscreen: boolean;
+	isOnActiveSpace: boolean;
 	isMain: boolean;
 	isFocused: boolean;
 }
@@ -422,6 +450,7 @@ interface WindowRefRecord {
 	scaleFactor: number;
 	isMinimized: boolean;
 	isOnscreen: boolean;
+	isOnActiveSpace: boolean;
 	isMain: boolean;
 	isFocused: boolean;
 }
@@ -485,6 +514,8 @@ const TOOL_NAMES = new Set([
 const MISSING_TARGET_ERROR = "No current controlled window. Call screenshot first to choose a target window.";
 const CURRENT_TARGET_GONE_ERROR =
 	"The current controlled window is no longer available. Call screenshot to choose a new target window.";
+const CURRENT_TARGET_OFF_SPACE_ERROR =
+	"The current controlled window is on another macOS Space. Call wake_window({ windowRef }) to bring it to the active Space, or screenshot to choose a different target.";
 const NON_MACOS_ERROR = "pi-computer-use currently supports macOS 15+ only.";
 
 const COMMAND_TIMEOUT_MS = 15_000;
@@ -1409,17 +1440,27 @@ function parseWindows(result: unknown): HelperWindow[] {
 	const array = Array.isArray(result) ? result : (result as any)?.windows;
 	if (!Array.isArray(array)) return [];
 
-	return array.map((raw) => ({
-		windowId: Number.isFinite((raw as any)?.windowId) ? Math.trunc((raw as any).windowId) : undefined,
-		windowRef: toOptionalString((raw as any)?.windowRef),
-		title: toOptionalString((raw as any)?.title) ?? "",
-		framePoints: parseFramePoints(raw),
-		scaleFactor: Math.max(1, toFiniteNumber((raw as any)?.scaleFactor, 1)),
-		isMinimized: toBoolean((raw as any)?.isMinimized),
-		isOnscreen: toBoolean((raw as any)?.isOnscreen),
-		isMain: toBoolean((raw as any)?.isMain),
-		isFocused: toBoolean((raw as any)?.isFocused),
-	}));
+	return array.map((raw) => {
+		const isMinimized = toBoolean((raw as any)?.isMinimized);
+		const isOnscreen = toBoolean((raw as any)?.isOnscreen);
+		// Native helper supplies `isOnActiveSpace` directly when it can,
+		// but fall back to (minimized OR onscreen) for older binaries.
+		const rawOnActive = (raw as any)?.isOnActiveSpace;
+		const isOnActiveSpace =
+			typeof rawOnActive === "boolean" ? rawOnActive : isMinimized || isOnscreen;
+		return {
+			windowId: Number.isFinite((raw as any)?.windowId) ? Math.trunc((raw as any).windowId) : undefined,
+			windowRef: toOptionalString((raw as any)?.windowRef),
+			title: toOptionalString((raw as any)?.title) ?? "",
+			framePoints: parseFramePoints(raw),
+			scaleFactor: Math.max(1, toFiniteNumber((raw as any)?.scaleFactor, 1)),
+			isMinimized,
+			isOnscreen,
+			isOnActiveSpace,
+			isMain: toBoolean((raw as any)?.isMain),
+			isFocused: toBoolean((raw as any)?.isFocused),
+		};
+	});
 }
 
 async function listApps(signal?: AbortSignal): Promise<HelperApp[]> {
@@ -1456,6 +1497,7 @@ function formatWindowLine(window: ListWindowsDetails["windows"][number]): string
 		window.isMain ? "main" : undefined,
 		window.isOnscreen ? "onscreen" : undefined,
 		window.isMinimized ? "minimized" : undefined,
+		window.isOnActiveSpace ? undefined : "off_active_space",
 		window.browserUseAllowed ? undefined : "browser_use_disabled",
 	]
 		.filter(Boolean)
@@ -1592,6 +1634,7 @@ function storeWindowRefForTarget(target: ResolvedTarget): string {
 		scaleFactor: target.scaleFactor,
 		isMinimized: target.isMinimized,
 		isOnscreen: target.isOnscreen,
+		isOnActiveSpace: target.isOnActiveSpace,
 		isMain: target.isMain,
 		isFocused: target.isFocused,
 	}).ref;
@@ -1609,6 +1652,7 @@ function storeWindowRefForAppWindow(app: HelperApp, window: HelperWindow): Windo
 		scaleFactor: window.scaleFactor,
 		isMinimized: window.isMinimized,
 		isOnscreen: window.isOnscreen,
+		isOnActiveSpace: window.isOnActiveSpace,
 		isMain: window.isMain,
 		isFocused: window.isFocused,
 	});
@@ -1759,6 +1803,10 @@ function scoreWindow(window: HelperWindow): number {
 	if (window.isMain) score += 80;
 	if (!window.isMinimized) score += 40;
 	if (window.isOnscreen) score += 20;
+	// Off-Space windows are still controllable but the user can't see
+	// them right now. Bias the auto-selection away from them so we
+	// only land there when there's nothing else.
+	if (!window.isOnActiveSpace) score -= 30;
 	if (window.windowId && window.windowId > 0) score += 10;
 	if (window.title.trim().length > 0) score += 2;
 	return score;
@@ -1770,6 +1818,7 @@ function summarizeWindowCandidate(window: HelperWindow): string {
 		window.isMain ? "main" : undefined,
 		window.isOnscreen ? "onscreen" : undefined,
 		window.isMinimized ? "minimized" : undefined,
+		window.isOnActiveSpace ? undefined : "off_active_space",
 	]
 		.filter(Boolean)
 		.join(",");
@@ -1853,6 +1902,7 @@ function toResolvedTarget(app: HelperApp, window: HelperWindow): ResolvedTarget 
 		scaleFactor: window.scaleFactor,
 		isMinimized: window.isMinimized,
 		isOnscreen: window.isOnscreen,
+		isOnActiveSpace: window.isOnActiveSpace,
 		isMain: window.isMain,
 		isFocused: window.isFocused,
 	};
@@ -1976,6 +2026,14 @@ async function resolveCurrentTarget(signal?: AbortSignal): Promise<ResolvedTarge
 
 	if (!match) {
 		throw new Error(CURRENT_TARGET_GONE_ERROR);
+	}
+
+	// If the only match we found is off-Space, the agent should know
+	// to either wake it or pick something else. Surface a specific
+	// error so the recovery loop is obvious.
+	if (!match.isOnActiveSpace && !match.isMinimized) {
+		const windowRef = storeWindowRefForAppWindow({ appName: current.appName, bundleId: current.bundleId, pid: current.pid }, match).ref;
+		throw new Error(`${CURRENT_TARGET_OFF_SPACE_ERROR} Suggested call: wake_window({ windowRef: "${windowRef}" }).`);
 	}
 
 	const app: HelperApp = {
@@ -3119,6 +3177,7 @@ async function performListWindows(params: ListWindowsParams, signal?: AbortSigna
 				scaleFactor: window.scaleFactor,
 				isMinimized: window.isMinimized,
 				isOnscreen: window.isOnscreen,
+				isOnActiveSpace: window.isOnActiveSpace,
 				isMain: window.isMain,
 				isFocused: window.isFocused,
 				browserUseAllowed: config.browser_use || !isBrowserApp(app.appName, app.bundleId),
@@ -3130,8 +3189,12 @@ async function performListWindows(params: ListWindowsParams, signal?: AbortSigna
 
 	const details: ListWindowsDetails = { tool: "list_windows", query, windows, config };
 	const lines = windows.map(formatWindowLine);
+	const offSpaceCount = windows.filter((w) => !w.isOnActiveSpace && !w.isMinimized).length;
+	const offSpaceHint = offSpaceCount > 0
+		? ` ${offSpaceCount} window${offSpaceCount === 1 ? " is" : "s are"} on another Space; use wake_window({ windowRef }) to bring ${offSpaceCount === 1 ? "it" : "them"} to the active Space.`
+		: "";
 	const text = lines.length
-		? `Found ${lines.length} controllable window${lines.length === 1 ? "" : "s"}. Use the @w refs with screenshot({ window: "@wN" }) or action tools' optional window field.\n${lines.join("\n")}`
+		? `Found ${lines.length} controllable window${lines.length === 1 ? "" : "s"}. Use the @w refs with screenshot({ window: "@wN" }) or action tools' optional window field.${offSpaceHint}\n${lines.join("\n")}`
 		: `No controllable windows matched the query. Try opening a window, or call list_apps to confirm the app is running.`;
 	return { content: [{ type: "text", text }], details };
 }
@@ -3620,6 +3683,72 @@ export async function executeListWindows(
 	return await executeTool(ctx, signal, () => performListWindows(params, signal));
 }
 
+export async function executeWakeWindow(
+	_toolCallId: string,
+	params: WakeWindowParams,
+	signal: AbortSignal | undefined,
+	_onUpdate: AgentToolUpdateCallback<WakeWindowDetails> | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<WakeWindowDetails>> {
+	return await executeTool(ctx, signal, () => performWakeWindow(params, signal));
+}
+
+async function performWakeWindow(params: WakeWindowParams, signal?: AbortSignal): Promise<AgentToolResult<WakeWindowDetails>> {
+	const rawParams = params ?? {};
+	const windowRef = trimOrUndefined(rawParams.windowRef);
+	const windowId = Number.isFinite(rawParams.windowId) ? Math.trunc(rawParams.windowId!) : undefined;
+	const explicitPid = Number.isFinite(rawParams.pid) ? Math.trunc(rawParams.pid!) : undefined;
+
+	let record: WindowRefRecord | undefined;
+	if (windowRef) {
+		record = runtimeState.windowRefs.get(windowRef);
+		if (!record) {
+			throw new Error(`Unknown window ref '${windowRef}'. Call list_windows to get current refs.`);
+		}
+	}
+
+	const pid = record?.pid ?? explicitPid;
+	if (!pid) {
+		throw new Error("wake_window requires either windowRef or both windowId and pid.");
+	}
+
+	const payload: Record<string, unknown> = { pid };
+	if (record?.nativeWindowRef) payload.windowRef = record.nativeWindowRef;
+	const effectiveWindowId = record?.windowId ?? windowId;
+	if (effectiveWindowId) payload.windowId = effectiveWindowId;
+
+	const result = await bridgeCommand<any>("wakeWindow", payload, { signal });
+	const appActivated = toBoolean(result?.appActivated);
+	const windowRaised = toBoolean(result?.windowRaised);
+
+	const details: WakeWindowDetails = {
+		tool: "wake_window",
+		query: rawParams,
+		appActivated,
+		windowRaised,
+		pid,
+		window: {
+			windowRef: record?.ref,
+			windowId: effectiveWindowId,
+			windowTitle: record?.windowTitle,
+			appName: record?.appName,
+		},
+	};
+
+	const pieces: string[] = [];
+	if (record?.appName) pieces.push(record.appName);
+	if (record?.windowTitle) pieces.push(`'${record.windowTitle}'`);
+	const label = pieces.length ? pieces.join(" ") : `pid ${pid}`;
+	const statusBits: string[] = [];
+	statusBits.push(`app activated: ${appActivated}`);
+	statusBits.push(`window raised: ${windowRaised}`);
+	const text = appActivated || windowRaised
+		? `Woke ${label} (${statusBits.join(", ")}). Call screenshot to inspect the window now that it's on the active Space.`
+		: `Could not wake ${label} (${statusBits.join(", ")}). The window may already be on the active Space, or the app refused the request.`;
+
+	return { content: [{ type: "text", text }], details };
+}
+
 export async function executeScreenshot(
 	_toolCallId: string,
 	params: ScreenshotParams,
@@ -3782,6 +3911,10 @@ export function reconstructStateFromBranch(ctx: ExtensionContext): void {
 					scaleFactor: Math.max(1, toFiniteNumber(window.scaleFactor, 1)),
 					isMinimized: toBoolean(window.isMinimized),
 					isOnscreen: toBoolean(window.isOnscreen),
+					isOnActiveSpace:
+						typeof window.isOnActiveSpace === "boolean"
+							? window.isOnActiveSpace
+							: toBoolean(window.isMinimized) || toBoolean(window.isOnscreen),
 					isMain: toBoolean(window.isMain),
 					isFocused: toBoolean(window.isFocused),
 				};
