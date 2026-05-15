@@ -170,19 +170,92 @@ final class InputSuppressionGuard {
 
 }
 
-/// Custom NSView that paints the agent's virtual cursor at the
-/// configured screen-local point. Drawing is intentionally simple:
-/// a translucent filled circle with a darker ring. We can iterate on
-/// the visual after the wiring is proven.
+/// Mouse button label for click-ring effect coloring.
+enum CursorEffectButton: String {
+	case left, right, middle
+
+	static func from(_ cg: CGMouseButton) -> CursorEffectButton {
+		switch cg {
+		case .right: return .right
+		case .center: return .middle
+		default: return .left
+		}
+	}
+
+	var color: NSColor {
+		switch self {
+		// Magenta tail of the cursor gradient. Reads as a definite
+		// "action happened here" without competing with the cursor.
+		case .left: return NSColor(calibratedRed: 0.914, green: 0.180, blue: 0.910, alpha: 1.0)
+		// Warm red for right-click; rare, semantically distinct.
+		case .right: return NSColor(calibratedRed: 0.95, green: 0.30, blue: 0.30, alpha: 1.0)
+		// Neutral gray for middle-click.
+		case .middle: return NSColor(calibratedWhite: 0.55, alpha: 1.0)
+		}
+	}
+}
+
+/// One expanding-ring "click happened here" effect. Multi-click (e.g.
+/// double, triple) is represented as several effects with staggered
+/// `startTime` offsets so the rings ripple out one after the other.
+struct ClickRingEffect {
+	let id: UUID
+	let globalPoint: CGPoint
+	let button: CursorEffectButton
+	let startTime: CFTimeInterval
+	static let duration: CFTimeInterval = 0.350
+
+	func isFinished(at now: CFTimeInterval) -> Bool {
+		return now - startTime >= ClickRingEffect.duration
+	}
+}
+
+/// One "text was entered here" flash effect. Either anchored to a
+/// global rect (the focused element's bounds) or `nil` to render as a
+/// small pill at the last cursor location. Two modes share the same
+/// timing so they're animated by the same tick loop.
+struct TypeFlashEffect {
+	let id: UUID
+	let globalRect: CGRect?
+	let fallbackCursorPoint: CGPoint?
+	let startTime: CFTimeInterval
+	static let duration: CFTimeInterval = 0.650
+
+	func isFinished(at now: CFTimeInterval) -> Bool {
+		return now - startTime >= TypeFlashEffect.duration
+	}
+}
+
+/// Pre-converted, per-screen-local effect descriptors that the view
+/// renders on each draw. The OverlayController owns effects in global
+/// CG coords and walks them per-screen at render time, mirroring how
+/// it handles `cursorPoint`.
+struct ScreenLocalClickRing {
+	let localPoint: CGPoint
+	let button: CursorEffectButton
+	let age: CFTimeInterval
+}
+
+struct ScreenLocalTypeFlash {
+	let localRect: CGRect
+	let age: CFTimeInterval
+}
+
 /// Custom NSView that paints the agent's virtual cursor at the
 /// configured screen-local point. Renders a paper-airplane shape
 /// translated from `assets/cursor.svg` (600x600 viewBox) into native
 /// NSBezierPath calls so we don't have to ship a sidecar asset and
 /// the shape scales crisply at any cursorSize. SVG (122.5, 101) is
 /// the click hotspot anchor.
+///
+/// The view also paints transient "effect" decorations behind the
+/// cursor - click rings and type flashes. The OverlayController
+/// pushes the screen-local descriptors here on each tick.
 final class OverlayCursorView: NSView {
 	var cursorPoint: CGPoint? = nil
 	var cursorSize: CGFloat = 28
+	var clickRings: [ScreenLocalClickRing] = []
+	var typeFlashes: [ScreenLocalTypeFlash] = []
 
 	// SVG viewBox dims and the in-viewBox coords of the click hotspot.
 	// Kept as named constants so the path-translation math reads
@@ -195,8 +268,14 @@ final class OverlayCursorView: NSView {
 	override var isFlipped: Bool { false }
 
 	override func draw(_ dirtyRect: NSRect) {
-		guard let point = cursorPoint else { return }
 		guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+		// Effects render *behind* the cursor so the cursor never gets
+		// occluded by the very thing it's announcing.
+		drawTypeFlashes(ctx)
+		drawClickRings(ctx)
+
+		guard let point = cursorPoint else { return }
 
 		// scale = cursorSize / svgViewBoxSize so the rendered icon is
 		// `cursorSize` points wide along its viewBox dimension.
@@ -254,6 +333,60 @@ final class OverlayCursorView: NSView {
 		ctx.restoreGState()
 
 		ctx.restoreGState()
+	}
+
+	/// Render every currently-active click ring as an expanding,
+	/// fading stroked circle. Radius and alpha are pure functions of
+	/// effect age so the controller can swap descriptors freely without
+	/// us holding any local animation state.
+	private func drawClickRings(_ ctx: CGContext) {
+		for ring in clickRings {
+			let t = max(0.0, min(1.0, ring.age / ClickRingEffect.duration))
+			// Radius grows from 0 to ~cursorSize as the ring ages.
+			let maxRadius = cursorSize * 1.05
+			let eased = OverlayController.easeOutCubic(t)
+			let radius = CGFloat(eased) * maxRadius
+			// Alpha decays linearly from 0.85 to 0 over the lifetime.
+			let alpha = CGFloat(0.85 * (1.0 - t))
+			if radius < 0.5 || alpha <= 0 { continue }
+			let rect = NSRect(
+				x: ring.localPoint.x - radius,
+				y: ring.localPoint.y - radius,
+				width: radius * 2,
+				height: radius * 2
+			)
+			let circle = NSBezierPath(ovalIn: rect)
+			ring.button.color.withAlphaComponent(alpha).setStroke()
+			circle.lineWidth = 2.5
+			circle.stroke()
+		}
+	}
+
+	/// Render every currently-active type flash as a 2pt rounded
+	/// rectangle outline whose alpha follows a 100ms-in / 250ms-hold /
+	/// 300ms-out envelope.
+	private func drawTypeFlashes(_ ctx: CGContext) {
+		for flash in typeFlashes {
+			let t = max(0.0, min(1.0, flash.age / TypeFlashEffect.duration))
+			// Envelope: fade in over first ~15%, hold to 55%, fade out
+			// over the final 45%. Numbers chosen so the user gets a clear
+			// "thing happened here" impression without it lingering.
+			let alpha: CGFloat
+			if t < 0.15 {
+				alpha = CGFloat(t / 0.15)
+			} else if t < 0.55 {
+				alpha = 1.0
+			} else {
+				alpha = CGFloat((1.0 - t) / 0.45)
+			}
+			if alpha <= 0 { continue }
+			let path = NSBezierPath(roundedRect: flash.localRect, xRadius: 4, yRadius: 4)
+			// Sky blue (matches the cursor gradient start) so the flash
+			// reads as part of the same visual language as the cursor.
+			NSColor(calibratedRed: 0.247, green: 0.710, blue: 0.984, alpha: alpha * 0.95).setStroke()
+			path.lineWidth = 2.0
+			path.stroke()
+		}
 	}
 
 	/// Build the cursor outline as an NSBezierPath at the given scale.
@@ -379,6 +512,8 @@ final class OverlayController {
 	private var lastGlobalPoint: CGPoint? = nil
 	private var currentDisplayedGlobalPoint: CGPoint? = nil
 	private var animation: CursorAnimation? = nil
+	private var clickRings: [ClickRingEffect] = []
+	private var typeFlashes: [TypeFlashEffect] = []
 	private var displayTimer: Timer? = nil
 	private var screenChangeObserver: NSObjectProtocol? = nil
 
@@ -412,6 +547,8 @@ final class OverlayController {
 		if !enabled { return }
 		enabled = false
 		cancelAnimation()
+		clickRings.removeAll()
+		typeFlashes.removeAll()
 		currentDisplayedGlobalPoint = nil
 		if let observer = screenChangeObserver {
 			NotificationCenter.default.removeObserver(observer)
@@ -491,6 +628,40 @@ final class OverlayController {
 		ensureDisplayTimer()
 	}
 
+	/// Trigger an expanding click-ring effect at the given global
+	/// CG point. Multi-click stamps multiple rings spaced 60ms apart
+	/// so the user sees them ripple. No-op when the overlay is off.
+	func triggerClickRing(globalPoint: CGPoint, button: CursorEffectButton, count: Int = 1) {
+		if !enabled { return }
+		let now = CACurrentMediaTime()
+		let stamped = max(1, min(5, count))
+		for i in 0..<stamped {
+			clickRings.append(ClickRingEffect(
+				id: UUID(),
+				globalPoint: globalPoint,
+				button: button,
+				startTime: now + CFTimeInterval(i) * 0.060
+			))
+		}
+		ensureDisplayTimer()
+	}
+
+	/// Trigger a type-flash effect. Pass `globalRect` when the focused
+	/// element's bounds are known (preferred), otherwise pass nil and
+	/// the view will draw a small pill near the last cursor position
+	/// so the user still gets some signal.
+	func triggerTypeFlash(globalRect: CGRect?) {
+		if !enabled { return }
+		let now = CACurrentMediaTime()
+		typeFlashes.append(TypeFlashEffect(
+			id: UUID(),
+			globalRect: globalRect,
+			fallbackCursorPoint: globalRect == nil ? lastGlobalPoint : nil,
+			startTime: now
+		))
+		ensureDisplayTimer()
+	}
+
 	private func ensureDisplayTimer() {
 		if displayTimer != nil { return }
 		// 60Hz tick. Timer on the main run loop is good enough for a
@@ -506,29 +677,54 @@ final class OverlayController {
 
 	private func cancelAnimation() {
 		animation = nil
-		displayTimer?.invalidate()
-		displayTimer = nil
+		// Don't kill the timer if effects still need ticking. The timer
+		// shutdown logic in `tick` checks both animation + effects so a
+		// click-ring fired right before the cursor finishes its tween
+		// keeps animating to completion.
+		if !hasActiveEffects() {
+			displayTimer?.invalidate()
+			displayTimer = nil
+		}
+	}
+
+	private func hasActiveEffects() -> Bool {
+		return !clickRings.isEmpty || !typeFlashes.isEmpty
 	}
 
 	private func tick() {
-		guard let anim = animation else {
+		let now = CACurrentMediaTime()
+
+		if let anim = animation {
+			let point = anim.point(at: now)
+			currentDisplayedGlobalPoint = point
+			if anim.isFinished(at: now) {
+				animation = nil
+			}
+		}
+
+		// Cull expired effects.
+		clickRings.removeAll { $0.isFinished(at: now) }
+		typeFlashes.removeAll { $0.isFinished(at: now) }
+
+		// Repaint with whatever cursor + effects are current.
+		let pointToRender = currentDisplayedGlobalPoint ?? lastGlobalPoint
+		if let pointToRender = pointToRender {
+			renderGlobalPoint(pointToRender, now: now)
+		} else {
+			renderEmpty(now: now)
+		}
+
+		if animation == nil && !hasActiveEffects() {
 			displayTimer?.invalidate()
 			displayTimer = nil
-			return
-		}
-		let now = CACurrentMediaTime()
-		let point = anim.point(at: now)
-		renderGlobalPoint(point)
-		currentDisplayedGlobalPoint = point
-		if anim.isFinished(at: now) {
-			cancelAnimation()
 		}
 	}
 
-	/// Paint the cursor at a specific global screen point across all
-	/// per-screen overlay windows. No state change — callers update
+/// Paint the cursor at a specific global screen point across all
+	/// per-screen overlay windows, plus any active effects projected
+	/// into screen-local coords. No state change - callers update
 	/// `currentDisplayedGlobalPoint` themselves.
-	private func renderGlobalPoint(_ globalPoint: CGPoint) {
+	private func renderGlobalPoint(_ globalPoint: CGPoint, now: CFTimeInterval = CACurrentMediaTime()) {
 		for (index, window) in windows.enumerated() {
 			let screen = window.screen ?? NSScreen.screens[index]
 			let local = convertGlobalToScreenLocal(globalPoint, screen: screen)
@@ -538,8 +734,57 @@ final class OverlayController {
 			} else {
 				view.cursorPoint = nil
 			}
+			view.clickRings = clickRings.compactMap { ring in
+				let local = convertGlobalToScreenLocal(ring.globalPoint, screen: screen)
+				return ScreenLocalClickRing(
+					localPoint: local,
+					button: ring.button,
+					age: now - ring.startTime
+				)
+			}
+			view.typeFlashes = typeFlashes.compactMap { flash in
+				let rect: CGRect
+				if let g = flash.globalRect {
+					rect = convertGlobalRectToScreenLocal(g, screen: screen)
+				} else if let p = flash.fallbackCursorPoint {
+					let local = convertGlobalToScreenLocal(p, screen: screen)
+					rect = CGRect(x: local.x + 14, y: local.y - 14, width: 80, height: 26)
+				} else {
+					return nil
+				}
+				return ScreenLocalTypeFlash(localRect: rect, age: now - flash.startTime)
+			}
 			view.needsDisplay = true
 		}
+	}
+
+	/// Repaint with no cursor (e.g. effects-only state). Lets a
+	/// type-flash fire even when we've never tracked a cursor point.
+	private func renderEmpty(now: CFTimeInterval) {
+		for (index, window) in windows.enumerated() {
+			let screen = window.screen ?? NSScreen.screens[index]
+			let view = views[index]
+			view.cursorPoint = nil
+			view.clickRings = clickRings.map { ring in
+				let local = convertGlobalToScreenLocal(ring.globalPoint, screen: screen)
+				return ScreenLocalClickRing(localPoint: local, button: ring.button, age: now - ring.startTime)
+			}
+			view.typeFlashes = typeFlashes.compactMap { flash in
+				guard let g = flash.globalRect else { return nil }
+				return ScreenLocalTypeFlash(localRect: convertGlobalRectToScreenLocal(g, screen: screen), age: now - flash.startTime)
+			}
+			view.needsDisplay = true
+		}
+	}
+
+	private func convertGlobalRectToScreenLocal(_ globalCG: CGRect, screen: NSScreen) -> CGRect {
+		let topLeft = convertGlobalToScreenLocal(CGPoint(x: globalCG.minX, y: globalCG.minY), screen: screen)
+		let bottomRight = convertGlobalToScreenLocal(CGPoint(x: globalCG.maxX, y: globalCG.maxY), screen: screen)
+		let x = min(topLeft.x, bottomRight.x)
+		let y = min(topLeft.y, bottomRight.y)
+		let w = abs(bottomRight.x - topLeft.x)
+		let h = abs(bottomRight.y - topLeft.y)
+		return CGRect(x: x, y: y, width: w, height: h)
 	}
 
 	static func easeOutCubic(_ t: Double) -> Double {
@@ -828,6 +1073,24 @@ final class Bridge {
 			let y = try doubleArg(request, "y")
 			OverlayController.shared.moveTo(globalPoint: CGPoint(x: x, y: y))
 			return ["moved": OverlayController.shared.isEnabled()]
+		case "overlayClickEffect":
+			let x = try doubleArg(request, "x")
+			let y = try doubleArg(request, "y")
+			let button = CursorEffectButton(rawValue: optionalStringArg(request, "button")?.lowercased() ?? "left") ?? .left
+			let count = optionalIntArg(request, "count") ?? 1
+			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: x, y: y), button: button, count: count)
+			return ["triggered": OverlayController.shared.isEnabled()]
+		case "overlayTypeEffect":
+			let x = try? doubleArg(request, "x")
+			let y = try? doubleArg(request, "y")
+			let w = try? doubleArg(request, "w")
+			let h = try? doubleArg(request, "h")
+			var rect: CGRect? = nil
+			if let x = x, let y = y, let w = w, let h = h, w > 0, h > 0 {
+				rect = CGRect(x: x, y: y, width: w, height: h)
+			}
+			OverlayController.shared.triggerTypeFlash(globalRect: rect)
+			return ["triggered": OverlayController.shared.isEnabled()]
 		case "overlayConfigure":
 			if let style = optionalStringArg(request, "style") {
 				OverlayController.shared.animationStyle = OverlayAnimationStyle(style)
@@ -1277,6 +1540,7 @@ final class Bridge {
 
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
 		OverlayController.shared.moveTo(globalPoint: point)
+		OverlayController.shared.triggerClickRing(globalPoint: point, button: .left)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["pressed": false, "reason": "hit_test_failed"]
 		}
@@ -1573,6 +1837,9 @@ final class Bridge {
 			return ["pressed": false, "reason": "element_ref_invalid"]
 		}
 		syncOverlayToElement(element)
+		if let frame = frameForElement(element) {
+			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: frame.midX, y: frame.midY), button: .left)
+		}
 		let result = performActionOrAncestor(startingAt: element, action: kAXPressAction as CFString, targetPid: targetPid)
 		var output: [String: Any] = ["pressed": result["performed"] as? Bool ?? false]
 		if let reason = result["reason"] as? String {
@@ -1594,6 +1861,9 @@ final class Bridge {
 			return ["performed": false, "reason": "element_ref_invalid"]
 		}
 		syncOverlayToElement(element)
+		if let frame = frameForElement(element) {
+			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: frame.midX, y: frame.midY), button: .left)
+		}
 		return performActionOrAncestor(startingAt: element, action: action, targetPid: targetPid)
 	}
 
@@ -2168,6 +2438,8 @@ final class Bridge {
 		if status != .success {
 			throw BridgeFailure(message: "Failed to set value (AX error \(status.rawValue))", code: "set_value_failed")
 		}
+		// Visual: outline the field that was just populated.
+		OverlayController.shared.triggerTypeFlash(globalRect: frameForElement(element))
 		return ["set": true]
 	}
 
@@ -2177,7 +2449,26 @@ final class Bridge {
 			throw BridgeFailure(message: "typeText requires pid in non-intrusive mode", code: "pid_required")
 		}
 		try postUnicodeText(text, pid: targetPid)
+		// Visual: try to outline the focused element if AX exposes one;
+		// otherwise the controller draws a small pill near the cursor.
+		let focused = focusedElementForPid(targetPid)
+		let focusedRect = focused.flatMap { frameForElement($0) }
+		OverlayController.shared.triggerTypeFlash(globalRect: focusedRect)
 		return ["typed": true]
+	}
+
+	/// Best-effort fetch of the currently focused element for a target
+	/// PID's app. Returns nil if the app exposes no focused element or
+	/// AX times out. Used by typeText to anchor the type-flash effect.
+	private func focusedElementForPid(_ pid: Int32) -> AXUIElement? {
+		let appElement = AXUIElementCreateApplication(pid)
+		AXUIElementSetMessagingTimeout(appElement, 1.0)
+		var focused: AnyObject?
+		let status = AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focused)
+		guard status == .success, let focused = focused else { return nil }
+		let cf = focused as CFTypeRef
+		guard CFGetTypeID(cf) == AXUIElementGetTypeID() else { return nil }
+		return unsafeBitCast(cf, to: AXUIElement.self)
 	}
 
 	private func getMousePosition() -> [String: Any] {
@@ -2602,6 +2893,13 @@ final class Bridge {
 
 	private func postMouseClick(at point: CGPoint, pid: Int32, button: CGMouseButton = .left, clickCount: Int = 1) throws {
 		try postMouseMove(to: point, pid: pid)
+		// Visual: announce the click before posting events so the user
+		// sees the ring expand even on extremely fast actions.
+		OverlayController.shared.triggerClickRing(
+			globalPoint: point,
+			button: CursorEffectButton.from(button),
+			count: max(1, clickCount)
+		)
 		for index in 1...max(1, clickCount) {
 			guard let down = CGEvent(mouseEventSource: nil, mouseType: mouseDownType(for: button), mouseCursorPosition: point, mouseButton: button),
 				let up = CGEvent(mouseEventSource: nil, mouseType: mouseUpType(for: button), mouseCursorPosition: point, mouseButton: button)
