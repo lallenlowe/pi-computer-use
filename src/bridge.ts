@@ -9,6 +9,7 @@ import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from 
 import { getComputerUseConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
 import { ensurePermissions, type PermissionStatus } from "./permissions.ts";
 import { loadAppInstructions, type AppInstructions } from "./app-instructions.ts";
+import { performAppleScript, type AppleScriptDetails, type AppleScriptParams } from "./apple-script.ts";
 
 type WindowSelector = string | number;
 type ImageMode = "auto" | "always" | "never";
@@ -471,6 +472,7 @@ const TOOL_NAMES = new Set([
 	"arrange_window",
 	"navigate_browser",
 	"computer_actions",
+	"apple_script",
 ]);
 
 const MISSING_TARGET_ERROR = "No current controlled window. Call screenshot first to choose a target window.";
@@ -3768,6 +3770,24 @@ export function reconstructStateFromBranch(ctx: ExtensionContext): void {
 		restoredCurrent = true;
 		continue;
 	}
+}
+
+export type { AppleScriptParams, AppleScriptDetails } from "./apple-script.ts";
+
+export async function executeAppleScript(
+	_toolCallId: string,
+	params: AppleScriptParams,
+	signal: AbortSignal | undefined,
+	_onUpdate: AgentToolUpdateCallback<AppleScriptDetails> | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<AppleScriptDetails>> {
+	// apple_script does not require the helper bridge or a controlled window;
+	// just execute it directly under the runtime lock to serialise with other
+	// computer-use calls so concurrent osascript invocations do not contend.
+	return await withRuntimeLock(async () => {
+		throwIfAborted(signal);
+		return await performAppleScript(params, signal);
+	});
 }
 
 export function stopBridge(): void {

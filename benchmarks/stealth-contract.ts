@@ -37,6 +37,7 @@ import path from "node:path";
 process.env.PI_COMPUTER_USE_STEALTH = "1";
 
 import {
+	executeAppleScript,
 	executeArrangeWindow,
 	executeClick,
 	executeKeypress,
@@ -344,6 +345,28 @@ async function main(): Promise<number> {
 		await runCase("navigate_browser.non_browser", "ax_success", () =>
 			executeNavigateBrowser("nb", { url: "https://example.com" }, undefined, undefined, ctx),
 		);
+	}
+
+	// 10. apple_script with a benign read-only Apple Event. Apple Events are
+	//     delivered per-process and do not raise the target app, so frontmost
+	//     must stay on the sentinel. We also assert frontmostDrifted is false
+	//     in the result payload.
+	const appleResult = await runCase("apple_script.read_only", "ax_success", () =>
+		executeAppleScript(
+			"as",
+			{ script: 'tell application "Finder" to get name of startup disk', app: "Finder" },
+			undefined,
+			undefined,
+			ctx,
+		),
+	);
+	const appleDetails = appleResult?.result?.details;
+	if (appleDetails && appleDetails.frontmostDrifted === true) {
+		const rec = records.find((r) => r.name === "apple_script.read_only");
+		if (rec) {
+			rec.status = "FAIL";
+			rec.notes = `${rec.notes ?? ""} apple_script reported frontmostDrifted=true`.trim();
+		}
 	}
 
 	const passed = records.filter((r) => r.status === "PASS").length;
