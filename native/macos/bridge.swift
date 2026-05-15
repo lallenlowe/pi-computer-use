@@ -1496,6 +1496,14 @@ final class Bridge {
 		let candidates = cgWindowCandidates(pid: pid)
 		var usedIds = Set<UInt32>()
 
+		// CGWindowList entries we'll use to synthesize "window exists but
+		// has no AX presence" entries after the AX walk. Off-Space windows
+		// generally don't appear in kAXWindowsAttribute at all, so we fill
+		// them in from CGWindowList so the agent can still see + wake them.
+		let candidatesByWindowId: [UInt32: CGWindowCandidate] = candidates.reduce(into: [:]) { acc, c in
+			acc[c.windowId] = c
+		}
+
 		var output: [[String: Any]] = []
 		for window in windows {
 			let axTitle = stringAttribute(window, attribute: kAXTitleAttribute as CFString) ?? ""
@@ -1551,6 +1559,45 @@ final class Bridge {
 			if let candidate {
 				item["windowId"] = Int(candidate.windowId)
 			}
+			output.append(item)
+		}
+
+		// Synthesize entries for CGWindowList windows that AX never
+		// surfaced. These are almost always off-Space windows: AX returns
+		// an empty kAXWindowsAttribute for them, but they remain fully
+		// addressable via CGWindowList and can be woken with wake_window.
+		// We mark them isOnActiveSpace=false so the agent knows to raise
+		// them before targeting; they have no windowRef because there's no
+		// live AX element to back one.
+		for (windowId, candidate) in candidatesByWindowId where !usedIds.contains(windowId) {
+			let bounds = candidate.bounds
+			// Apply the same minimum-size filter as for AX windows so we
+			// don't surface every transient HUD/palette as a controllable
+			// target; off-Space windows of real apps still pass this since
+			// CGWindowList preserves their last on-screen size.
+			if bounds.width < 100 || bounds.height < 80 { continue }
+			let title = candidate.title
+			// Without an AX element we can't tell a real window from a
+			// detached toolbar/sheet. Require a non-empty title to filter
+			// the chrome out; real off-Space windows almost always retain
+			// their title in CGWindowList.
+			if title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+			var item: [String: Any] = [
+				"title": title,
+				"framePoints": [
+					"x": bounds.origin.x,
+					"y": bounds.origin.y,
+					"w": bounds.size.width,
+					"h": bounds.size.height,
+				],
+				"scaleFactor": displayScaleFactor(for: bounds),
+				"isMinimized": false,
+				"isOnscreen": candidate.isOnscreen,
+				"isOnActiveSpace": candidate.isOnscreen,
+				"isMain": false,
+				"isFocused": false,
+				"windowId": Int(windowId),
+			]
 			output.append(item)
 		}
 		return output
@@ -2753,7 +2800,12 @@ final class Bridge {
 			}
 
 			let title = (entry[kCGWindowName as String] as? String) ?? ""
-			let isOnscreen = (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? true
+			// kCGWindowIsOnscreen is documented as only being present when
+			// the window is on-screen. A missing value therefore means the
+			// window is off-screen (most commonly because it lives on a
+			// different macOS Space). We previously defaulted missing -> true
+			// which made every off-Space window look on-screen.
+			let isOnscreen = (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
 			candidates.append(
 				CGWindowCandidate(
 					windowId: windowNumber,
