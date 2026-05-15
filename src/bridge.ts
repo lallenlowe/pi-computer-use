@@ -444,6 +444,12 @@ interface RuntimeState {
 	permissionStatus?: PermissionStatus;
 	lastPermissionCheckAt: number;
 	helperInstallChecked: boolean;
+	// Per-app instructions are emitted at most once per (pi-session, source,
+	// matchedKey) tuple. Without this set we'd burn ~500-2000 tokens of static
+	// markdown into every screenshot result. The model retains the first ship
+	// in conversation history; subsequent screenshots get a short breadcrumb
+	// reminding it the instructions were already provided.
+	shippedAppInstructions: Set<string>;
 }
 
 type MouseButtonName = "left" | "right" | "middle";
@@ -547,6 +553,7 @@ const runtimeState: RuntimeState = {
 	windowRefByIdentity: new Map(),
 	windowWriteQueues: new Map(),
 	nextWindowRefIndex: 1,
+	shippedAppInstructions: new Set(),
 };
 
 class HelperTransportError extends Error {
@@ -2240,8 +2247,10 @@ async function buildToolResult(
 	};
 
 	// Per-app instructions. Only inject on screenshot results — that's the
-	// "you're now looking at this app" moment. Repeating on every action would
-	// burn tokens for no new info. Absence of a file is normal and silent.
+	// "you're now looking at this app" moment. Repeating the full markdown on
+	// every screenshot would burn tokens for no new info, so we ship the full
+	// body once per (session, source, matchedKey) tuple and a short breadcrumb
+	// after that. Absence of a file is normal and silent.
 	let appInstructionsText = "";
 	if (tool === "screenshot") {
 		try {
@@ -2251,9 +2260,15 @@ async function buildToolResult(
 			});
 			if (instructions) {
 				details.appInstructions = instructions;
+				const shipKey = `${instructions.source}:${instructions.matchedKey}`;
 				const headerNote = instructions.source === "user" ? "user override" : "bundled";
 				const truncatedNote = instructions.truncated ? ", truncated to ~3KB" : "";
-				appInstructionsText = `\n\n--- App-specific instructions for ${result.target.appName} (${headerNote}${truncatedNote}) ---\n${instructions.text}\n--- end instructions ---`;
+				if (runtimeState.shippedAppInstructions.has(shipKey)) {
+					appInstructionsText = `\n\nApp-specific instructions for ${result.target.appName} (${headerNote}) were already provided earlier in this session \u2014 follow them. Restart pi to re-ship.`;
+				} else {
+					appInstructionsText = `\n\n--- App-specific instructions for ${result.target.appName} (${headerNote}${truncatedNote}) ---\n${instructions.text}\n--- end instructions ---`;
+					runtimeState.shippedAppInstructions.add(shipKey);
+				}
 			}
 		} catch {
 			// Loader is best-effort. Never block a tool result on instruction lookup.
