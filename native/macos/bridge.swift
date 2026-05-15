@@ -170,11 +170,177 @@ final class InputSuppressionGuard {
 
 }
 
+/// Custom NSView that paints the agent's virtual cursor at the
+/// configured screen-local point. Drawing is intentionally simple:
+/// a translucent filled circle with a darker ring. We can iterate on
+/// the visual after the wiring is proven.
+final class OverlayCursorView: NSView {
+	var cursorPoint: CGPoint? = nil
+	var cursorSize: CGFloat = 28
+
+	override var isFlipped: Bool { false }
+
+	override func draw(_ dirtyRect: NSRect) {
+		guard let point = cursorPoint else { return }
+		let radius = cursorSize / 2
+		let rect = NSRect(
+			x: point.x - radius,
+			y: point.y - radius,
+			width: cursorSize,
+			height: cursorSize
+		)
+		let circle = NSBezierPath(ovalIn: rect)
+		NSColor(calibratedRed: 1.0, green: 0.5, blue: 0.0, alpha: 0.45).setFill()
+		circle.fill()
+		NSColor(calibratedRed: 1.0, green: 0.3, blue: 0.0, alpha: 0.95).setStroke()
+		circle.lineWidth = 2.5
+		circle.stroke()
+
+		// Center dot for sub-pixel anchor.
+		let dotRect = NSRect(
+			x: point.x - 2,
+			y: point.y - 2,
+			width: 4,
+			height: 4
+		)
+		NSColor.black.withAlphaComponent(0.85).setFill()
+		NSBezierPath(ovalIn: dotRect).fill()
+	}
+}
+
+/// Owns the per-screen overlay windows that draw the agent's virtual
+/// cursor. Lives entirely on main; all mutating methods must be called
+/// from main (or routed there).
+///
+/// The overlay is gated by an explicit `enable()` call. `enable()`
+/// also flips the helper from `.prohibited` to `.accessory` activation
+/// policy because `.prohibited` apps cannot host any windows. This is
+/// the one observable behavior change for users who turn the overlay
+/// on. `.accessory` keeps the helper out of the dock and out of
+/// cmd-tab, so it remains stealthy.
+final class OverlayController {
+	static let shared = OverlayController()
+
+	private var enabled = false
+	private var windows: [NSWindow] = []
+	private var views: [OverlayCursorView] = []
+	private var lastGlobalPoint: CGPoint? = nil
+	private var screenChangeObserver: NSObjectProtocol? = nil
+
+	private init() {}
+
+	func enable() {
+		if enabled { return }
+		enabled = true
+		if NSApp.activationPolicy() != .accessory {
+			NSApp.setActivationPolicy(.accessory)
+		}
+		rebuildWindows()
+		screenChangeObserver = NotificationCenter.default.addObserver(
+			forName: NSApplication.didChangeScreenParametersNotification,
+			object: nil,
+			queue: .main
+		) { [weak self] _ in
+			self?.rebuildWindows()
+		}
+		if let point = lastGlobalPoint {
+			moveTo(globalPoint: point)
+		}
+	}
+
+	func disable() {
+		if !enabled { return }
+		enabled = false
+		if let observer = screenChangeObserver {
+			NotificationCenter.default.removeObserver(observer)
+			screenChangeObserver = nil
+		}
+		for window in windows {
+			window.orderOut(nil)
+		}
+		windows.removeAll()
+		views.removeAll()
+		// Drop back to invisible-helper mode. We don't bother flipping
+		// activation policy back to .prohibited because that's a one-way
+		// transition for some AppKit machinery; .accessory with no windows
+		// is functionally invisible.
+	}
+
+	func isEnabled() -> Bool { enabled }
+
+	/// Move the cursor to a global screen coordinate expressed in
+	/// CGEvent / Quartz convention (origin top-left of primary screen).
+	/// Internally converts to AppKit coordinates per screen.
+	func moveTo(globalPoint: CGPoint) {
+		lastGlobalPoint = globalPoint
+		if !enabled { return }
+		for (index, window) in windows.enumerated() {
+			let screen = window.screen ?? NSScreen.screens[index]
+			let local = convertGlobalToScreenLocal(globalPoint, screen: screen)
+			let view = views[index]
+			if NSPointInRect(NSPoint(x: local.x, y: local.y), screen.frame.offsetBy(dx: -screen.frame.origin.x, dy: -screen.frame.origin.y)) {
+				view.cursorPoint = local
+			} else {
+				view.cursorPoint = nil
+			}
+			view.needsDisplay = true
+		}
+	}
+
+	private func rebuildWindows() {
+		for window in windows {
+			window.orderOut(nil)
+		}
+		windows.removeAll()
+		views.removeAll()
+		for screen in NSScreen.screens {
+			let frame = screen.frame
+			let window = NSWindow(
+				contentRect: frame,
+				styleMask: [.borderless],
+				backing: .buffered,
+				defer: false,
+				screen: screen
+			)
+			window.isOpaque = false
+			window.backgroundColor = .clear
+			window.hasShadow = false
+			window.ignoresMouseEvents = true
+			window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) - 1)
+			window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+			window.isReleasedWhenClosed = false
+			window.acceptsMouseMovedEvents = false
+			window.hidesOnDeactivate = false
+			let view = OverlayCursorView(frame: NSRect(origin: .zero, size: frame.size))
+			view.wantsLayer = true
+			window.contentView = view
+			window.orderFrontRegardless()
+			windows.append(window)
+			views.append(view)
+		}
+	}
+
+	/// Quartz/CG global coordinates have origin at top-left of the
+	/// *primary* screen with y increasing downward. AppKit (NSWindow,
+	/// NSScreen) has origin at bottom-left of the primary screen with y
+	/// increasing upward. NSWindow content view coordinates are local
+	/// to that window's frame in AppKit space, so for a borderless
+	/// window matching the screen frame, view-local coords are global
+	/// AppKit coords minus the screen's origin.
+	private func convertGlobalToScreenLocal(_ globalCG: CGPoint, screen: NSScreen) -> CGPoint {
+		let primaryHeight = NSScreen.screens.first?.frame.height ?? screen.frame.height
+		let appKitGlobal = NSPoint(x: globalCG.x, y: primaryHeight - globalCG.y)
+		return NSPoint(x: appKitGlobal.x - screen.frame.origin.x, y: appKitGlobal.y - screen.frame.origin.y)
+	}
+}
+
 final class Bridge {
 	private let refStore = AXRefStore()
 	private let inputSuppressionGuard = InputSuppressionGuard()
 	private var stdinBuffer = Data()
 	private var axEnhancedEnabledPids = Set<Int32>()
+	private let stdinQueue = DispatchQueue(label: "pi-computer-use.bridge.stdin")
+	private var stdinReadSource: DispatchSourceRead?
 
 	/// Force-populates an app's AX tree by setting `AXEnhancedUserInterface` and
 	/// `AXManualAccessibility` on its application element. Many apps — Electron,
@@ -190,17 +356,46 @@ final class Bridge {
 		_ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
 	}
 
-	func run() {
-		while true {
-			autoreleasepool {
-				let data = FileHandle.standardInput.availableData
-				if data.isEmpty {
-					exit(0)
-				}
-				stdinBuffer.append(data)
-				processBufferedInput()
+	/// Wire stdin into the AppKit run loop. We can't block on
+	/// `availableData` from main any more because main has to host
+	/// `NSApplication.shared.run()` for overlay windows, animation
+	/// timers, and any future AppKit-driven UI. So we read stdin on a
+	/// background queue via DispatchSource and marshal each parsed
+	/// request onto main for handling.
+	func start() {
+		let readSource = DispatchSource.makeReadSource(
+			fileDescriptor: FileHandle.standardInput.fileDescriptor,
+			queue: stdinQueue
+		)
+		self.stdinReadSource = readSource
+		readSource.setEventHandler { [weak self] in
+			guard let self = self else { return }
+			let available = max(Int(readSource.data), 4096)
+			var buffer = Data(count: available)
+			let bytesRead: Int = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+				guard let base = rawBuffer.baseAddress else { return -1 }
+				return read(FileHandle.standardInput.fileDescriptor, base, available)
+			}
+			if bytesRead == 0 {
+				// EOF on stdin: parent went away, mirror the prior behavior
+				// of the blocking-availableData loop and exit cleanly.
+				readSource.cancel()
+				return
+			}
+			if bytesRead < 0 {
+				// EAGAIN/EINTR or similar; let DispatchSource fire again.
+				return
+			}
+			let slice = buffer.prefix(bytesRead)
+			DispatchQueue.main.async {
+				self.stdinBuffer.append(slice)
+				self.processBufferedInput()
 			}
 		}
+		readSource.setCancelHandler {
+			DispatchQueue.main.async { exit(0) }
+		}
+		readSource.resume()
 	}
 
 	private func processBufferedInput() {
@@ -355,6 +550,17 @@ final class Bridge {
 			return try typeText(request)
 		case "getMousePosition":
 			return getMousePosition()
+		case "overlayEnable":
+			OverlayController.shared.enable()
+			return ["enabled": OverlayController.shared.isEnabled()]
+		case "overlayDisable":
+			OverlayController.shared.disable()
+			return ["enabled": OverlayController.shared.isEnabled()]
+		case "overlayMoveTo":
+			let x = try doubleArg(request, "x")
+			let y = try doubleArg(request, "y")
+			OverlayController.shared.moveTo(globalPoint: CGPoint(x: x, y: y))
+			return ["moved": OverlayController.shared.isEnabled()]
 		default:
 			throw BridgeFailure(message: "Unknown command '\(cmd)'", code: "unknown_command")
 		}
@@ -792,6 +998,7 @@ final class Bridge {
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		OverlayController.shared.moveTo(globalPoint: point)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["pressed": false, "reason": "hit_test_failed"]
 		}
@@ -1087,6 +1294,7 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["pressed": false, "reason": "element_ref_invalid"]
 		}
+		syncOverlayToElement(element)
 		let result = performActionOrAncestor(startingAt: element, action: kAXPressAction as CFString, targetPid: targetPid)
 		var output: [String: Any] = ["pressed": result["performed"] as? Bool ?? false]
 		if let reason = result["reason"] as? String {
@@ -1107,6 +1315,7 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["performed": false, "reason": "element_ref_invalid"]
 		}
+		syncOverlayToElement(element)
 		return performActionOrAncestor(startingAt: element, action: action, targetPid: targetPid)
 	}
 
@@ -1118,6 +1327,7 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["focused": false, "reason": "element_ref_invalid"]
 		}
+		syncOverlayToElement(element)
 		return focusElementOrAncestor(startingAt: element, targetPid: targetPid)
 	}
 
@@ -1132,6 +1342,7 @@ final class Bridge {
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		OverlayController.shared.moveTo(globalPoint: point)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["focused": false, "reason": "hit_test_failed"]
 		}
@@ -1147,6 +1358,7 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["scrolled": false, "reason": "element_ref_invalid"]
 		}
+		syncOverlayToElement(element)
 		return performScrollActionOrAncestor(startingAt: element, targetPid: targetPid, scrollX: optionalIntArg(request, "scrollX") ?? 0, scrollY: optionalIntArg(request, "scrollY") ?? 0, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
 	}
 
@@ -1160,10 +1372,21 @@ final class Bridge {
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
+		OverlayController.shared.moveTo(globalPoint: point)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["scrolled": false, "reason": "hit_test_failed"]
 		}
 		return performScrollActionOrAncestor(startingAt: hitElement, targetPid: targetPid, scrollX: optionalIntArg(request, "scrollX") ?? 0, scrollY: optionalIntArg(request, "scrollY") ?? 0, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
+	}
+
+	/// Move the overlay cursor to the visual center of an AX element if
+	/// the element exposes a frame. Used by `*Element` AX commands so
+	/// click({ ref }) animates the cursor to the right place even when
+	/// no raw coordinate was supplied.
+	private func syncOverlayToElement(_ element: AXUIElement) {
+		guard let frame = frameForElement(element) else { return }
+		let center = CGPoint(x: frame.midX, y: frame.midY)
+		OverlayController.shared.moveTo(globalPoint: center)
 	}
 
 	private func hitTestElement(at point: CGPoint) -> AXUIElement? {
@@ -2048,6 +2271,11 @@ final class Bridge {
 			throw BridgeFailure(message: "Failed to create mouse move event", code: "input_failed")
 		}
 		postEvent(move, pid: pid)
+		// Sync the agent overlay cursor. No-op when the overlay is
+		// disabled. Single chokepoint: every mouseClick / mouseDrag /
+		// scrollWheel goes through here first so we don't need to wire
+		// each command site individually.
+		OverlayController.shared.moveTo(globalPoint: point)
 	}
 
 	private func mouseButton(_ name: String) -> CGMouseButton {
@@ -2271,7 +2499,12 @@ final class Bridge {
 }
 
 _ = NSApplication.shared
+// Stay invisible by default. The overlay subsystem flips this to
+// `.accessory` lazily on the first overlay.enable request so users who
+// never enable the overlay see zero behavior change vs the prior
+// `.prohibited` helper.
 NSApp.setActivationPolicy(.prohibited)
 
 let bridge = Bridge()
-bridge.run()
+bridge.start()
+NSApplication.shared.run()

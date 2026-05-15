@@ -6,12 +6,18 @@ export interface ComputerUseConfig {
 	browser_use: boolean;
 	stealth_mode: boolean;
 	apple_script: AppleScriptConfig;
+	overlay: OverlayConfig;
 }
 
 export interface AppleScriptConfig {
 	enabled: boolean;
 	restore_frontmost_on_drift: boolean;
 	timeout_ms: number;
+}
+
+export interface OverlayConfig {
+	enabled: boolean;
+	size: number;
 }
 
 export interface ComputerUseConfigSource {
@@ -33,10 +39,16 @@ const DEFAULT_APPLE_SCRIPT_CONFIG: AppleScriptConfig = {
 	timeout_ms: 5000,
 };
 
+const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
+	enabled: false,
+	size: 28,
+};
+
 const DEFAULT_CONFIG: ComputerUseConfig = {
 	browser_use: true,
 	stealth_mode: false,
 	apple_script: { ...DEFAULT_APPLE_SCRIPT_CONFIG },
+	overlay: { ...DEFAULT_OVERLAY_CONFIG },
 };
 
 let activeConfig: ComputerUseConfig = { ...DEFAULT_CONFIG };
@@ -50,6 +62,19 @@ function parseBoolean(value: unknown): boolean | undefined {
 	if (["1", "true", "yes", "on", "enabled"].includes(normalized)) return true;
 	if (["0", "false", "no", "off", "disabled"].includes(normalized)) return false;
 	return undefined;
+}
+
+function normalizeOverlay(raw: unknown): Partial<OverlayConfig> | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const src = raw as any;
+	const out: Partial<OverlayConfig> = {};
+	const enabled = parseBoolean(src.enabled);
+	if (enabled !== undefined) out.enabled = enabled;
+	const size = src.size;
+	if (typeof size === "number" && Number.isFinite(size) && size > 0) {
+		out.size = Math.trunc(size);
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function normalizeAppleScript(raw: unknown): Partial<AppleScriptConfig> | undefined {
@@ -79,6 +104,10 @@ function normalizePartial(raw: unknown): Partial<ComputerUseConfig> {
 	if (appleScript) {
 		out.apple_script = { ...DEFAULT_APPLE_SCRIPT_CONFIG, ...appleScript };
 	}
+	const overlay = normalizeOverlay((source as any).overlay);
+	if (overlay) {
+		out.overlay = { ...DEFAULT_OVERLAY_CONFIG, ...overlay };
+	}
 	return out;
 }
 
@@ -105,6 +134,10 @@ function readEnv(): Partial<ComputerUseConfig> {
 	if (appleScriptEnabled !== undefined) {
 		out.apple_script = { ...DEFAULT_APPLE_SCRIPT_CONFIG, enabled: appleScriptEnabled };
 	}
+	const overlayEnabled = parseBoolean(process.env.PI_COMPUTER_USE_OVERLAY);
+	if (overlayEnabled !== undefined) {
+		out.overlay = { ...DEFAULT_OVERLAY_CONFIG, enabled: overlayEnabled };
+	}
 	return out;
 }
 
@@ -117,6 +150,7 @@ export function loadComputerUseConfig(cwd: string): LoadedComputerUseConfig {
 	const config: ComputerUseConfig = {
 		...DEFAULT_CONFIG,
 		apple_script: { ...DEFAULT_CONFIG.apple_script },
+		overlay: { ...DEFAULT_CONFIG.overlay },
 	};
 	for (const source of sources) {
 		if (source.values) Object.assign(config, source.values);
@@ -145,6 +179,10 @@ export function isBrowserUseEnabled(): boolean {
 
 export function getAppleScriptConfig(): AppleScriptConfig {
 	return activeConfig.apple_script;
+}
+
+export function getOverlayConfig(): OverlayConfig {
+	return activeConfig.overlay;
 }
 
 /**
@@ -184,6 +222,12 @@ export function saveUserComputerUseConfig(update: Partial<ComputerUseConfig>): s
 		merged.apple_script = {
 			...(typeof flatExisting.apple_script === "object" && flatExisting.apple_script !== null ? flatExisting.apple_script : {}),
 			...update.apple_script,
+		};
+	}
+	if (update.overlay !== undefined) {
+		merged.overlay = {
+			...(typeof flatExisting.overlay === "object" && flatExisting.overlay !== null ? flatExisting.overlay : {}),
+			...update.overlay,
 		};
 	}
 	writeFileSync(targetPath, JSON.stringify(merged, null, 2) + "\n", "utf-8");

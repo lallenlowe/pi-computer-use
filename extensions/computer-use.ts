@@ -585,6 +585,12 @@ async function openSettingsTUI(ctx: { ui: any; cwd: string }): Promise<void> {
 			currentValue: snapToTimeoutChoice(current.apple_script.timeout_ms),
 			values: TIMEOUT_CHOICES.slice(),
 		},
+		{
+			id: "overlay.enabled",
+			label: "overlay.enabled (show agent cursor on screen)",
+			currentValue: onOff(current.overlay.enabled),
+			values: ["on", "off"],
+		},
 	];
 
 	await ctx.ui.custom((tui: any, theme: any, _kb: any, done: (value: undefined) => void) => {
@@ -667,6 +673,14 @@ function applySettingChange(ctx: { cwd: string }, id: string, newValue: string):
 				},
 			});
 			break;
+		case "overlay.enabled":
+			saveUserComputerUseConfig({
+				overlay: {
+					...getLoadedComputerUseConfig().config.overlay,
+					enabled: boolValue,
+				},
+			});
+			break;
 		case "apple_script.timeout_ms": {
 			const ms = parseInt(newValue, 10);
 			if (!Number.isFinite(ms) || ms <= 0) {
@@ -695,6 +709,7 @@ function formatConfigStatus(): string {
 		`browser_use: ${loaded.config.browser_use ? "enabled" : "disabled"}`,
 		`stealth_mode: ${loaded.config.stealth_mode ? "enabled" : "disabled"}`,
 		`apple_script: ${loaded.config.apple_script.enabled ? "enabled" : "disabled"} (restore_frontmost_on_drift=${loaded.config.apple_script.restore_frontmost_on_drift}, timeout_ms=${loaded.config.apple_script.timeout_ms})`,
+		`overlay: ${loaded.config.overlay.enabled ? "enabled" : "disabled"} (size=${loaded.config.overlay.size})`,
 		"",
 		"Sources:",
 	];
