@@ -1,6 +1,6 @@
 {
-	"name": "@injaneity/pi-computer-use",
-	"version": "0.2.4",
+	"name": "@lallenlowe/pi-computer-use",
+	"version": "0.3.0",
 	"description": "Codex-style computer-use tools for Pi on macOS.",
 	"type": "module",
 	"keywords": [
@@ -15,12 +15,12 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/injaneity/pi-computer-use.git"
+		"url": "git+https://github.com/lallenlowe/pi-computer-use.git"
 	},
 	"bugs": {
-		"url": "https://github.com/injaneity/pi-computer-use/issues"
+		"url": "https://github.com/lallenlowe/pi-computer-use/issues"
 	},
-	"homepage": "https://github.com/injaneity/pi-computer-use#readme",
+	"homepage": "https://github.com/lallenlowe/pi-computer-use#readme",
 	"engines": {
 		"node": ">=20.6.0"
 	},

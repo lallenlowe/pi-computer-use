@@ -5,10 +5,10 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@injaneity/pi-computer-use"><img alt="npm" src="https://img.shields.io/npm/v/@injaneity/pi-computer-use?style=flat-square"></a>
-  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/github/license/injaneity/pi-computer-use?style=flat-square"></a>
+  <a href="https://www.npmjs.com/package/@lallenlowe/pi-computer-use"><img alt="npm" src="https://img.shields.io/npm/v/@lallenlowe/pi-computer-use?style=flat-square"></a>
+  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/github/license/lallenlowe/pi-computer-use?style=flat-square"></a>
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square">
-  <a href="https://github.com/injaneity/pi-computer-use/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/injaneity/pi-computer-use/ci.yml?branch=main&style=flat-square"></a>
+  <a href="https://github.com/lallenlowe/pi-computer-use/actions/workflows/ci.yml"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/lallenlowe/pi-computer-use/ci.yml?branch=main&style=flat-square"></a>
 </p>
 
 Codex-style computer use for [Pi](https://pi.dev/) on macOS.
@@ -32,7 +32,7 @@ Codex-style computer use for [Pi](https://pi.dev/) on macOS.
 Install the Pi package:
 
 ```bash
-pi install git:github.com/injaneity/pi-computer-use@v0.2.4
+pi install git:github.com/lallenlowe/pi-computer-use@v0.3.0
 ```
 
 Start Pi in interactive mode. On the first session, grant macOS permissions to:
@@ -167,29 +167,27 @@ npm run benchmark:qa:full
 
 ## Release & Install Notes
 
-The package is published on npm as `@injaneity/pi-computer-use`.
-
-```bash
-npm install @injaneity/pi-computer-use
-npm install @injaneity/pi-computer-use@0.2.4
-```
+The package name is `@lallenlowe/pi-computer-use`. It is not yet published to public npm; install from GitHub.
 
 Pi installs should pin a GitHub release tag:
 
 ```bash
-pi install git:github.com/injaneity/pi-computer-use@v0.2.4
-pi install -l git:github.com/injaneity/pi-computer-use@v0.2.4
+pi install git:github.com/lallenlowe/pi-computer-use@v0.3.0
+pi install -l git:github.com/lallenlowe/pi-computer-use@v0.3.0
 pi install /absolute/path/to/pi-computer-use
 ```
 
 Remove:
 
 ```bash
-pi remove git:github.com/injaneity/pi-computer-use@v0.2.4
-npm remove @injaneity/pi-computer-use
+pi remove git:github.com/lallenlowe/pi-computer-use@v0.3.0
 ```
 
-For a different release, replace `v0.2.4` or `0.2.4` with the version you want to pin.
+For a different release, replace `v0.3.0` with the version you want to pin.
+
+### Project history
+
+This project began as a fork of [`injaneity/pi-computer-use`](https://github.com/injaneity/pi-computer-use). The forklift refactor (slices A–E across PRs #21–#25) collapsed the dual-mode codebase into a single per-PID input path, dropped the browser-bootstrap helper, replaced the `stealth_mode` toggle with a `requireFocusChangeApproval` gate on the only two tools that actually move focus, and renamed the package. From v0.3.0 onward this is a separate project.
 
 ## Screenshots
 

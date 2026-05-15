@@ -76,10 +76,12 @@ node scripts/build-native.mjs --arch all \
 The default signing identifier is:
 
 ```text
-com.injaneity.pi-computer-use.bridge
+com.lallenlowe.pi-computer-use.bridge
 ```
 
 Keep that identifier stable for release builds so macOS permissions remain tied to the same helper identity across updates.
+
+**Identifier change in v0.3.0:** the previous identifier (`com.injaneity.pi-computer-use.bridge`) was renamed during the forklift refactor. Existing installs will need to re-grant Accessibility and Screen Recording permissions to the new identifier the first time the helper runs after upgrade.
 
 ## Validation
 
