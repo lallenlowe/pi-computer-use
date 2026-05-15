@@ -69,8 +69,6 @@ type CaseRecord = {
 	axOnly?: boolean;
 	axExecution?: boolean;
 	fallbackUsed?: boolean;
-	stealthCompatible?: boolean;
-	executionVariant?: string;
 	details?: string;
 	capability?: string;
 };
@@ -120,7 +118,7 @@ function goalStatus(current: ReturnType<typeof metrics>) {
 	const checks = Object.entries(goals).map(([metric, target]) => {
 		const currentValue = Number((current as any)[metric] ?? 0);
 		const goalValue = Number(target ?? 0);
-		const higherIsBetter = ["axOnlyRatio", "coreAxOnlyRatio", "capabilityPassRatio", "capabilityStealthRatio"].includes(metric);
+		const higherIsBetter = ["axOnlyRatio", "coreAxOnlyRatio", "capabilityPassRatio"].includes(metric);
 		const status = higherIsBetter ? currentValue >= goalValue : currentValue <= goalValue;
 		const details = higherIsBetter ? `expected >= ${goalValue}, got ${currentValue}` : `expected <= ${goalValue}, got ${currentValue}`;
 		return { metric, current: currentValue, target: goalValue, status: (status ? "PASS" : "FAIL") as "PASS" | "FAIL", details };
@@ -130,7 +128,7 @@ function goalStatus(current: ReturnType<typeof metrics>) {
 
 function compareMetrics(current: ReturnType<typeof metrics>, baseline: ReturnType<typeof metrics>) {
 	const config = readJsonFile(CONFIG_PATH)?.regressionTolerance ?? {};
-	const higherIsBetter = new Set(["axOnlyRatio", "coreAxOnlyRatio", "axExecutionRatio", "navigationAxOnlyRatio", "targetingAxOnlyRatio", "capabilityPassRatio", "capabilityStealthRatio"]);
+	const higherIsBetter = new Set(["axOnlyRatio", "coreAxOnlyRatio", "axExecutionRatio", "navigationAxOnlyRatio", "targetingAxOnlyRatio", "capabilityPassRatio"]);
 	const checks = Object.entries(config).map(([metric, tolerance]) => {
 		const currentValue = Number((current as any)[metric] ?? 0);
 		const baselineValue = Number((baseline as any)[metric] ?? 0);
@@ -241,7 +239,7 @@ function prepareAppWindow(appName: string): void {
 	}
 }
 
-function summarizeResult(result: any): { hasImage: boolean; axTargets: number; fallbackUsed: boolean; axExecution: boolean; stealthCompatible: boolean; executionVariant: string } {
+function summarizeResult(result: any): { hasImage: boolean; axTargets: number; fallbackUsed: boolean; axExecution: boolean; strategy: string } {
 	const content = Array.isArray(result?.content) ? result.content : [];
 	const details = result?.details ?? {};
 	return {
@@ -249,8 +247,7 @@ function summarizeResult(result: any): { hasImage: boolean; axTargets: number; f
 		axTargets: Array.isArray(details?.axTargets) ? details.axTargets.length : 0,
 		fallbackUsed: details?.execution?.fallbackUsed === true,
 		axExecution: details?.execution?.axSucceeded === true || String(details?.execution?.strategy ?? "").startsWith("ax_"),
-		stealthCompatible: details?.execution?.stealthCompatible === true,
-		executionVariant: String(details?.execution?.variant ?? "unknown"),
+		strategy: String(details?.execution?.strategy ?? "unknown"),
 	};
 }
 
@@ -340,7 +337,6 @@ function metrics(records: CaseRecord[]) {
 		visionFallbackRatio: ratio(executed, (record) => record.hasImage === true),
 		coreVisionFallbackRatio: ratio(coreExecuted, (record) => record.hasImage === true),
 		axExecutionRatio: ratio(targeting, (record) => record.axExecution === true && record.fallbackUsed !== true),
-		stealthCompatibleRatio: ratio(executed, (record) => record.stealthCompatible === true),
 		navigationAxOnlyRatio: ratio(navigation, (record) => record.axOnly === true),
 		targetingAxOnlyRatio: ratio(targeting, (record) => record.axOnly === true && record.axExecution === true),
 		primitivePassRatio: ratio(primitives, (record) => record.status === "PASS"),
@@ -348,7 +344,6 @@ function metrics(records: CaseRecord[]) {
 		capabilityTotal: capabilities.length,
 		capabilityExecuted: executedCapabilities.length,
 		capabilityPassRatio: ratio(executedCapabilities, (record) => record.status === "PASS"),
-		capabilityStealthRatio: ratio(executedCapabilities, (record) => record.stealthCompatible === true),
 		avgLatencyMs: avgLatency(executed),
 		avgNavigationLatencyMs: avgLatency(navigation),
 		avgTargetingLatencyMs: avgLatency(targeting),
@@ -393,9 +388,7 @@ async function benchmarkCase(
 				axOnly: !summary.hasImage,
 				axExecution: summary.axExecution,
 				fallbackUsed: summary.fallbackUsed,
-				stealthCompatible: summary.stealthCompatible,
-				executionVariant: summary.executionVariant,
-				details: `axTargets=${summary.axTargets} hasImage=${summary.hasImage} axExecution=${summary.axExecution} fallback=${summary.fallbackUsed} variant=${summary.executionVariant} stealthCompatible=${summary.stealthCompatible}`,
+				details: `axTargets=${summary.axTargets} hasImage=${summary.hasImage} axExecution=${summary.axExecution} fallback=${summary.fallbackUsed} strategy=${summary.strategy}`,
 				capability,
 			}),
 			result,

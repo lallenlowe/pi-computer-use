@@ -73,13 +73,11 @@ Important metrics:
 - `visionFallbackRatio`
 - `coreVisionFallbackRatio`
 - `axExecutionRatio`
-- `stealthCompatibleRatio`
 - `navigationAxOnlyRatio`
 - `targetingAxOnlyRatio`
 - `primitivePassRatio`
 - `batchPassRatio`
 - `capabilityPassRatio`
-- `capabilityStealthRatio`
 - `avgLatencyMs`
 - `avgNavigationLatencyMs`
 - `avgTargetingLatencyMs`
@@ -140,14 +138,14 @@ This benchmark should be treated as the official gate for semantic-targeting cha
 
 For documentation-only changes, running this benchmark is usually not necessary.
 
-## Stealth contract regression
+## Focus contract regression
 
-`benchmarks/stealth-contract.ts` is a separate, focused harness that asserts the stealth-mode contract: when `PI_COMPUTER_USE_STEALTH=1` is on, no public tool may change the user's frontmost app or window. It activates a sentinel app (default: Finder), drives a different running app (default: Slack), and re-reads frontmost after every tool call.
+`benchmarks/focus-contract.ts` is a separate, focused harness that asserts the focus contract: no public input tool may change the user's frontmost app or window. (`surface_window` and `launch_app({ activate: true })` are the only tools that legitimately change frontmost; they're gated by `requireFocusChangeApproval` and intentionally excluded from this test.) It activates a sentinel app (default: Finder), drives a different running app (default: Slack), and re-reads frontmost after every tool call.
 
 ```bash
-npx -y tsx benchmarks/stealth-contract.ts
-npx -y tsx benchmarks/stealth-contract.ts --target "Google Chrome"
-npx -y tsx benchmarks/stealth-contract.ts --sentinel TextEdit --output stealth.json
+npx -y tsx benchmarks/focus-contract.ts
+npx -y tsx benchmarks/focus-contract.ts --target "Google Chrome"
+npx -y tsx benchmarks/focus-contract.ts --sentinel TextEdit --output focus.json
 ```
 
-Exits non-zero if any case observes frontmost drift. Run this against any change that touches `focusControlledWindow`, `restoreUserFocus`, AppleScript paths, or stealth gates.
+Exits non-zero if any case observes frontmost drift. Run this against any change that touches per-PID input delivery, AppleScript paths, the focus-approval gate, or anything else that could leak focus.

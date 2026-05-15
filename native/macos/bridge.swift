@@ -52,9 +52,9 @@ final class Box<T> {
 
 // NOTE: this used to host InputSuppressionGuard, a global CGEventTap that
 // swallowed the user's keyboard/mouse while the browser-bootstrap AppleScript
-// raced to open a fresh window. The bootstrap is gone (post stealth model v2
-// every input op posts per-PID via CGEventPostToPid and never raises a
-// window), so the suppression tap had no callers and is removed.
+// raced to open a fresh window. Every input op now posts per-PID via
+// CGEventPostToPid and never raises a window, so the bootstrap and the
+// suppression tap are gone.
 
 /// Mouse button label for click-ring effect coloring.
 enum CursorEffectButton: String {
@@ -388,7 +388,7 @@ struct CursorAnimation {
 /// policy because `.prohibited` apps cannot host any windows. This is
 /// the one observable behavior change for users who turn the overlay
 /// on. `.accessory` keeps the helper out of the dock and out of
-/// cmd-tab, so it remains stealthy.
+/// cmd-tab, so it stays out of the user's way.
 final class OverlayController {
 	static let shared = OverlayController()
 
@@ -2036,7 +2036,7 @@ final class Bridge {
 				if (role == "AXTextArea" || role == "AXTextView") && frame.width * frame.height > windowArea * 0.55 && !canSetValue { continue }
 				let label = [title, description, value].first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? ""
 				let normalizedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-				// Score with a high baseline — a stealth-only model needs the composer
+				// Score with a high baseline — the model needs the composer
 				// to surface above generic chrome buttons. Text inputs are precious in
 				// hybrid apps; if we found one this deep, the user almost certainly
 				// wants to interact with it.

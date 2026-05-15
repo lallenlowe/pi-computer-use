@@ -538,7 +538,7 @@ const appleScriptTool = defineTool(withCompactRendering({
 	name: "apple_script",
 	label: "AppleScript",
 	description:
-		"Run an AppleScript via osascript and return stdout/stderr plus frontmost-app drift detection. Use this for app operations that AX can't reach (Messages send, Mail compose, Notes create, Music playback, Finder commands, etc.) where the app exposes an AppleScript dictionary. Apple Events are delivered to the target process directly and do not raise its window or change frontmost \u2014 stealth-safe by mechanism, same guarantee as per-PID keypress.",
+		"Run an AppleScript via osascript and return stdout/stderr plus frontmost-app drift detection. Use this for app operations that AX can't reach (Messages send, Mail compose, Notes create, Music playback, Finder commands, etc.) where the app exposes an AppleScript dictionary. Apple Events are delivered to the target process directly and do not raise its window or change frontmost \u2014 same focus-safety guarantee as per-PID keypress.",
 	promptSnippet:
 		"Run an AppleScript when AX/keypress can't drive the operation. Common cases: sending iMessage via Messages, Mail compose, Music transport, Finder commands.",
 	promptGuidelines: [
@@ -568,7 +568,7 @@ const computerActionsTool = defineTool(withCompactRendering({
 		"Use this to save turns/tokens when the next actions are obvious from the latest screenshot.",
 		"Do not batch when you need to inspect the result of an intermediate action before deciding the next action.",
 		"Coordinates and refs come from the latest screenshot; the tool returns one state update after all actions finish.",
-		"Per-action metadata reports whether each action used the stealth or default implementation variant.",
+		"Per-action metadata reports the strategy used (ax_press, ax_set_value, coordinate_event_click, per_pid_keypress, ...), whether AX was attempted/succeeded, and whether a fallback fired.",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({

@@ -2,10 +2,10 @@
 
 Electron app. Content lives inside an `AXWebArea`. The bridge surfaces both chrome (Search, nav tabs, Back/Forward, workspace switcher) and the composer (`AXTextArea` "Message to ...") via the hybrid text-input rescue pass — coordinates are rarely needed.
 
-## Stealth-mode happy path
+## Happy path
 
 1. `screenshot` Slack — composer surfaces as `@e1 AXTextArea "Message to <person|channel>"`.
-2. `set_text({ ref, text })` to draft. Works in stealth without raising Slack.
+2. `set_text({ ref, text })` to draft. Lands without raising Slack.
 3. **Always confirm with the user before sending.**
 4. After confirmation, `keypress({ keys: ["Return"] })` to send.
 
@@ -19,8 +19,8 @@ Electron app. Content lives inside an `AXWebArea`. The bridge surfaces both chro
 ## Navigation
 
 - Left rail tabs (`Home`, `DMs`, `Activity`, `Later`, `More…`, `Files`) are `AXRadioButton`s with subrole `AXTabButton`. `click({ ref })` them, never coordinates.
-- Search button at the top of the toolbar (`AXButton "Search"`) opens the search UI; press it, `set_text` the query, `keypress(["Return"])`. Stealth-clean path to find anything.
-- `cmd+k` (quick-switcher) **works in stealth** — keypress is delivered per-PID without raising Slack. **But** Slack's own handler activates the window when the modal opens, so frontmost briefly shifts to Slack as a side-effect. Prefer the Search button when you need to stay clean.
+- Search button at the top of the toolbar (`AXButton "Search"`) opens the search UI; press it, `set_text` the query, `keypress(["Return"])`. Background-clean path to find anything.
+- `cmd+k` (quick-switcher) is delivered per-PID and lands without us raising Slack. **But** Slack's own handler activates the window when the modal opens, so frontmost briefly shifts to Slack as a side-effect. Prefer the Search button when you need to stay clean.
 - `cmd+,` opens Preferences. Don't change settings unless asked.
 
 ## Composer

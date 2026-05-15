@@ -62,7 +62,7 @@ Use `/computer-use` in Pi to inspect the effective config and config sources.
 
 ## What It Adds to Pi
 
-- Public tools: `list_apps`, `list_windows`, `screenshot`, `click`, `double_click`, `move_mouse`, `drag`, `scroll`, `keypress`, `type_text`, `set_text`, `wait`, `arrange_window`, `navigate_browser`, `computer_actions`.
+- Public tools: `list_apps`, `list_windows`, `screenshot`, `click`, `double_click`, `move_mouse`, `drag`, `scroll`, `keypress`, `type_text`, `set_text`, `wait`, `arrange_window`, `computer_actions`, `apple_script`, `wake_window`, `surface_window`, `launch_app`.
 - AX target refs in tool results, with capabilities such as `canSetValue`, `canPress`, `canFocus`, `canScroll`, and `adjust`.
 - Stable window refs from `list_windows`, with explicit targeting such as `screenshot({ window: "@w1" })` and `click({ window: "@w1", ref: "@eN" })`.
 - State IDs for stale-action detection.
@@ -70,10 +70,11 @@ Use `/computer-use` in Pi to inspect the effective config and config sources.
 - Optional screenshot attachment mode with `image: "auto" | "always" | "never"`.
 - Ref-first actions such as `click({ ref: "@eN" })`, `scroll({ ref: "@eN" })`, and `set_text({ ref: "@eN", text })`.
 - Batched actions through `computer_actions`, with one post-action semantic state update plus per-action execution metadata.
-- Execution metadata that reports `stealth` for background-safe AX paths and `default` for focus/raw-event fallbacks.
+- Execution metadata that reports the strategy used (`ax_press`, `ax_set_value`, `coordinate_event_click`, `per_pid_keypress`, …), AX attempt/success, and fallback usage.
 - Full pointer and keyboard primitive coverage for common GUI flows, with AX-first equivalents where available.
 - Browser-aware targeting, including isolated browser window preference where appropriate.
-- Optional strict AX mode for background-safe operation without foreground focus, raw pointer events, raw keyboard events, or cursor takeover.
+- Per-PID input delivery for clicks, keypresses, text, scroll, and drag — events land in the target app's queue without changing the user's frontmost or moving the system cursor.
+- A `requireFocusChangeApproval` gate on the only two tools that can change frontmost (`surface_window`, `launch_app({activate:true})`): `ctx.ui.confirm` by default, skippable with `focus_auto_approve`.
 - Official QA benchmark harness in [`benchmarks/`](./benchmarks/README.md).
 
 ## Examples
@@ -121,14 +122,14 @@ See [docs/usage.md](./docs/usage.md) for the full workflow and tool patterns.
 2. The TypeScript bridge in [`src/bridge.ts`](./src/bridge.ts) manages the current window, capture IDs, AX refs, fallback policy, batching, and execution metadata.
 3. The native Swift helper in [`native/macos/bridge.swift`](./native/macos/bridge.swift) talks to macOS Accessibility, ScreenCaptureKit, AppKit, and CoreGraphics.
 
-The result is semantic-first GUI control: Pi sees useful AX targets first, falls back to screenshots only when needed, and reports whether each action stayed background-safe.
+The result is semantic-first GUI control: Pi sees useful AX targets first, falls back to screenshots only when needed, and reports the execution path of each action.
 
 ## Documentation
 
-- [Usage guide](./docs/usage.md): tool workflow, AX refs, text input, browser flows, batching, and strict AX mode.
-- [Configuration](./docs/configuration.md): config files, environment overrides, browser control, and stealth mode.
+- [Usage guide](./docs/usage.md): tool workflow, AX refs, text input, browser flows, batching, and the focus-change approval gate.
+- [Configuration](./docs/configuration.md): config files, environment overrides, browser control, and `focus_auto_approve`.
 - [Development](./docs/development.md): local setup, helper builds, validation, release signing notes, and PR workflow.
-- [Troubleshooting](./docs/troubleshooting.md): permissions, helper setup, stale refs, browser refusal, and strict mode errors.
+- [Troubleshooting](./docs/troubleshooting.md): permissions, helper setup, stale refs, and browser refusal.
 - [Benchmarks](./benchmarks/README.md): benchmark commands, metrics, regression policy, and local comparison workflow.
 - [Contributing](./CONTRIBUTING.md): issue-first contribution rules and PR checklist.
 

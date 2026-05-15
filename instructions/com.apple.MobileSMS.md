@@ -6,9 +6,9 @@ Catalyst app. Composer surfaces as `AXTextField "Message" [setValue,press,focus]
 - The Send button never enables.
 - `keypress(["Return"])` is a no-op because the framework still thinks the composer is empty.
 
-**Use `apple_script` to actually send.** Apple Events are stealth-safe; they deliver to the Messages process without raising it.
+**Use `apple_script` to actually send.** Apple Events deliver to the Messages process without raising it or changing your frontmost.
 
-## Stealth-mode happy path (sending)
+## Happy path (sending)
 
 ```applescript
 tell application "Messages"
