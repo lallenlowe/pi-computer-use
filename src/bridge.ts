@@ -10,6 +10,7 @@ import { getAppleScriptConfig, getComputerUseConfig, getOverlayConfig, isBrowser
 import { ensurePermissions, type PermissionStatus } from "./permissions.ts";
 import { loadAppInstructions, type AppInstructions } from "./app-instructions.ts";
 import { performAppleScript, type AppleScriptDetails, type AppleScriptParams } from "./apple-script.ts";
+import { requireFocusChangeApproval } from "./focus-approval.ts";
 
 type WindowSelector = string | number;
 type ImageMode = "auto" | "always" | "never";
@@ -78,12 +79,24 @@ export interface SurfaceWindowParams {
 	windowRef?: string;
 	windowId?: number;
 	pid?: number;
+	/**
+	 * Short user-facing reason the agent wants to take focus. Required
+	 * unless focus_auto_approve is enabled. Surfaced in the ctx.ui.confirm
+	 * prompt so the user knows why they're being asked to switch apps.
+	 */
+	reason?: string;
 }
 
 export interface LaunchAppParams {
 	bundleId?: string;
 	appName?: string;
 	activate?: boolean;
+	/**
+	 * Short user-facing reason the agent wants to take focus. Required
+	 * when activate=true (unless focus_auto_approve is enabled). Ignored
+	 * when activate is false/omitted (background launch is unconditional).
+	 */
+	reason?: string;
 }
 
 export interface LaunchAppDetails {
@@ -1575,6 +1588,7 @@ function formatModeMarker(): string {
 	}
 	bits.push(`apple_script: ${config.apple_script.enabled ? "enabled" : "disabled"}`);
 	bits.push(`browser_use: ${config.browser_use ? "allowed" : "blocked"}`);
+	bits.push(`focus_auto_approve: ${config.focus_auto_approve ? "on (focus tools skip the confirm prompt)" : "off (surface_window / launch_app({activate:true}) prompt the user)"}`);
 	return bits.join(" \u00b7 ");
 }
 
@@ -3600,7 +3614,7 @@ export async function executeSurfaceWindow(
 	_onUpdate: AgentToolUpdateCallback<SurfaceWindowDetails> | undefined,
 	ctx: ExtensionContext,
 ): Promise<AgentToolResult<SurfaceWindowDetails>> {
-	return await executeTool(ctx, signal, () => performSurfaceWindow(params, signal));
+	return await executeTool(ctx, signal, () => performSurfaceWindow(params, ctx, signal));
 }
 
 /**
@@ -3726,9 +3740,17 @@ async function performWakeWindow(params: WakeWindowParams, signal?: AbortSignal)
 	return { content: [{ type: "text", text: lines.join("\n") }], details };
 }
 
-async function performSurfaceWindow(params: SurfaceWindowParams, signal?: AbortSignal): Promise<AgentToolResult<SurfaceWindowDetails>> {
+async function performSurfaceWindow(params: SurfaceWindowParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<AgentToolResult<SurfaceWindowDetails>> {
 	const rawParams = params ?? {};
 	const { record, pid, payload, effectiveWindowId } = resolveWindowTargetForWake(rawParams, "surface_window");
+
+	await requireFocusChangeApproval({
+		ctx,
+		toolName: "surface_window",
+		appName: record?.appName ?? `pid ${pid}`,
+		reason: rawParams.reason ?? "",
+		signal,
+	});
 
 	const result = await bridgeCommand<any>("surfaceWindow", payload, { signal });
 	const appActivated = toBoolean(result?.appActivated);
@@ -3764,10 +3786,10 @@ export async function executeLaunchApp(
 	_onUpdate: AgentToolUpdateCallback<LaunchAppDetails> | undefined,
 	ctx: ExtensionContext,
 ): Promise<AgentToolResult<LaunchAppDetails>> {
-	return await executeTool(ctx, signal, () => performLaunchApp(params, signal));
+	return await executeTool(ctx, signal, () => performLaunchApp(params, ctx, signal));
 }
 
-async function performLaunchApp(params: LaunchAppParams, signal?: AbortSignal): Promise<AgentToolResult<LaunchAppDetails>> {
+async function performLaunchApp(params: LaunchAppParams, ctx: ExtensionContext, signal?: AbortSignal): Promise<AgentToolResult<LaunchAppDetails>> {
 	const rawParams = params ?? {};
 	const bundleId = trimOrUndefined(rawParams.bundleId);
 	const appName = trimOrUndefined(rawParams.appName);
@@ -3777,17 +3799,18 @@ async function performLaunchApp(params: LaunchAppParams, signal?: AbortSignal): 
 		throw new Error("launch_app requires bundleId or appName.");
 	}
 
-	// Stealth v2: launching with activate=false is always safe (the
-	// app starts in the background, no surprise focus change).
-	// Launching with activate=true would steal focus, so it has the
-	// same gate as surface_window: agent must ask user permission
-	// first. Refuse here so the agent gets a clean error pointing it
-	// at the right pattern; outside stealth, activation is allowed
-	// because the user opted out of the contract.
-	if (activate && isStrictAxMode()) {
-		throw new Error(
-			"launch_app({ activate: true }) would steal focus and is gated in stealth mode for the same reason as surface_window. Either: (a) launch with activate=false (background launch is always allowed), then ask the user for permission and call surface_window if you need the app foreground, or (b) ask the user for permission first, then launch with activate=true.",
-		);
+	// Background launch (activate=false) is always allowed; the new app
+	// starts behind the user's frontmost. Foreground launch (activate=true)
+	// is a focus change and goes through the same approval gate as
+	// surface_window.
+	if (activate) {
+		await requireFocusChangeApproval({
+			ctx,
+			toolName: "launch_app({activate:true})",
+			appName: appName ?? bundleId ?? "app",
+			reason: rawParams.reason ?? "",
+			signal,
+		});
 	}
 
 	const payload: Record<string, unknown> = { activate };

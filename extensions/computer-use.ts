@@ -140,11 +140,11 @@ const launchAppTool = defineTool(withCompactRendering({
 	name: "launch_app",
 	label: "Launch App",
 	description: "Launch an app by bundleId or appName. Defaults to background launch (no focus change). Returns the pid for immediate use with screenshot/list_windows.",
-	promptSnippet: "Launch a macOS app. Background by default; pass activate=true to bring it foreground (requires user permission in stealth).",
+	promptSnippet: "Launch a macOS app. Background by default; pass activate=true to bring it foreground (prompts the user unless focus_auto_approve is on).",
 	promptGuidelines: [
 		"Use this when an app the agent wants to control isn't currently running. Pass bundleId (preferred, e.g. 'com.apple.TextEdit') or appName (e.g. 'TextEdit').",
-		"Default activate=false launches in the background without changing the user's frontmost. Always safe under stealth.",
-		"Pass activate=true to bring the app foreground; in stealth this requires explicit user permission first ('Need to bring <App> forward to do <task>; OK?'). Outside stealth, activation is allowed.",
+		"Default activate=false launches in the background without changing the user's frontmost. Always allowed.",
+		"Pass activate=true to bring the app foreground. The tool will prompt the user via ctx.ui.confirm with your `reason`; if focus_auto_approve is set, the prompt is skipped. Always provide a clear `reason` when activate=true.",
 		"After a successful launch, use the returned pid with screenshot({ pid }) or list_windows({ pid }) - no need for an extra discovery round-trip.",
 		"If the app is already running, this returns alreadyRunning=true with the existing pid; no second instance is started.",
 	],
@@ -152,7 +152,8 @@ const launchAppTool = defineTool(withCompactRendering({
 	parameters: Type.Object({
 		bundleId: Type.Optional(Type.String({ description: "App bundle identifier (preferred), e.g. 'com.apple.TextEdit'." })),
 		appName: Type.Optional(Type.String({ description: "App display name, e.g. 'TextEdit'. Used when bundleId is unknown." })),
-		activate: Type.Optional(Type.Boolean({ description: "Whether to bring the app foreground on launch. Default false (background, stealth-safe). True requires user permission in stealth." })),
+		activate: Type.Optional(Type.Boolean({ description: "Whether to bring the app foreground on launch. Default false (background, no focus change). True triggers a user-approval prompt unless focus_auto_approve is enabled." })),
+		reason: Type.Optional(Type.String({ description: "Short user-facing reason for taking focus, e.g. 'open Obsidian Settings to install update'. Required when activate=true unless focus_auto_approve is enabled." })),
 	}),
 	async execute(toolCallId, params: LaunchAppParams, signal, onUpdate, ctx) {
 		return await executeLaunchApp(toolCallId, params, signal, onUpdate, ctx);
@@ -162,10 +163,10 @@ const launchAppTool = defineTool(withCompactRendering({
 const surfaceWindowTool = defineTool(withCompactRendering({
 	name: "surface_window",
 	label: "Surface Window",
-	description: "DISRUPTIVE: activate the app and raise the target window. macOS will switch the user's viewport to the window's Space (or move the window to the active Space, depending on Spaces settings). Only call after the user has explicitly approved disturbing their workspace.",
-	promptSnippet: "Last-resort surface call for off-Space windows. Requires explicit user permission ('Need to bring <App> forward to do <task>; OK?') because it switches the user's viewport.",
+	description: "DISRUPTIVE: activate the app and raise the target window. macOS will switch the user's viewport to the window's Space (or move the window to the active Space, depending on Spaces settings). Prompts the user via ctx.ui.confirm (with your `reason`) before activating, unless focus_auto_approve is enabled in config.",
+	promptSnippet: "Last-resort surface call for off-Space windows. Prompts the user via ctx.ui.confirm with your `reason` (skipped if focus_auto_approve is on).",
 	promptGuidelines: [
-		"Do NOT call without first asking the user for permission. surface_window switches the user's viewport - that's a foreground-takeover, not a recovery.",
+		"surface_window switches the user's viewport - that's a foreground-takeover, not a recovery. The tool itself prompts the user via ctx.ui.confirm; pass a clear `reason` so the user knows why.",
 		"Before considering surface_window, call wake_window first and exhaust the non-GUI alternatives it reports (apple_script, bundled app instructions, URL schemes).",
 		"Pass the @wN windowRef returned by list_windows; falling back to {windowId, pid} also works for non-stored refs.",
 		"After surface_window succeeds, call screenshot({ window: '@wN' }) to inspect the window now that it is on the active Space.",
@@ -175,6 +176,7 @@ const surfaceWindowTool = defineTool(withCompactRendering({
 		windowRef: Type.Optional(Type.String({ description: "Window ref like @w1 returned by list_windows or screenshot." })),
 		windowId: Type.Optional(Type.Number({ description: "CGWindowID for the target window. Required when windowRef is omitted; must be paired with pid." })),
 		pid: Type.Optional(Type.Number({ description: "Process ID owning the window. Required when windowRef is omitted." })),
+		reason: Type.Optional(Type.String({ description: "Short user-facing reason for taking focus, e.g. 'inspect Obsidian Settings to install update'. Required unless focus_auto_approve is enabled." })),
 	}),
 	async execute(toolCallId, params: SurfaceWindowParams, signal, onUpdate, ctx) {
 		return await executeSurfaceWindow(toolCallId, params, signal, onUpdate, ctx);
@@ -619,6 +621,12 @@ async function openSettingsTUI(ctx: { ui: any; cwd: string }): Promise<void> {
 			values: ["on", "off"],
 		},
 		{
+			id: "focus_auto_approve",
+			label: "focus_auto_approve (skip ctx.ui.confirm for surface_window / launch_app activate=true)",
+			currentValue: onOff(current.focus_auto_approve),
+			values: ["on", "off"],
+		},
+		{
 			id: "apple_script.enabled",
 			label: "apple_script.enabled (allow apple_script tool)",
 			currentValue: onOff(current.apple_script.enabled),
@@ -708,6 +716,9 @@ function applySettingChange(ctx: { cwd: string }, id: string, newValue: string):
 		case "stealth_mode":
 			saveUserComputerUseConfig({ stealth_mode: boolValue });
 			break;
+		case "focus_auto_approve":
+			saveUserComputerUseConfig({ focus_auto_approve: boolValue });
+			break;
 		case "apple_script.enabled":
 			saveUserComputerUseConfig({
 				apple_script: {
@@ -759,6 +770,7 @@ function formatConfigStatus(): string {
 		"",
 		`browser_use: ${loaded.config.browser_use ? "enabled" : "disabled"}`,
 		`stealth_mode: ${loaded.config.stealth_mode ? "enabled" : "disabled"}`,
+		`focus_auto_approve: ${loaded.config.focus_auto_approve ? "enabled" : "disabled"}`,
 		`apple_script: ${loaded.config.apple_script.enabled ? "enabled" : "disabled"} (restore_frontmost_on_drift=${loaded.config.apple_script.restore_frontmost_on_drift}, timeout_ms=${loaded.config.apple_script.timeout_ms})`,
 		`overlay: ${loaded.config.overlay.enabled ? "enabled" : "disabled"} (size=${loaded.config.overlay.size}, animation=${loaded.config.overlay.animation_style}@${loaded.config.overlay.animation_duration_ms}ms, occlusion_aware=${loaded.config.overlay.occlusion_aware})`,
 		"",
