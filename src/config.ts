@@ -5,6 +5,13 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 export interface ComputerUseConfig {
 	browser_use: boolean;
 	stealth_mode: boolean;
+	/**
+	 * When true, focus-changing tools (surface_window,
+	 * launch_app({activate:true})) skip the user-approval prompt and
+	 * activate immediately. When false (default), the tool calls
+	 * ctx.ui.confirm and proceeds only if the user accepts.
+	 */
+	focus_auto_approve: boolean;
 	apple_script: AppleScriptConfig;
 	overlay: OverlayConfig;
 }
@@ -53,6 +60,7 @@ const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
 const DEFAULT_CONFIG: ComputerUseConfig = {
 	browser_use: true,
 	stealth_mode: false,
+	focus_auto_approve: false,
 	apple_script: { ...DEFAULT_APPLE_SCRIPT_CONFIG },
 	overlay: { ...DEFAULT_OVERLAY_CONFIG },
 };
@@ -117,8 +125,10 @@ function normalizePartial(raw: unknown): Partial<ComputerUseConfig> {
 	const out: Partial<ComputerUseConfig> = {};
 	const browserUse = parseBoolean((source as any).browser_use ?? (source as any).browserUse);
 	const stealthMode = parseBoolean((source as any).stealth_mode ?? (source as any).stealthMode);
+	const focusAutoApprove = parseBoolean((source as any).focus_auto_approve ?? (source as any).focusAutoApprove);
 	if (browserUse !== undefined) out.browser_use = browserUse;
 	if (stealthMode !== undefined) out.stealth_mode = stealthMode;
+	if (focusAutoApprove !== undefined) out.focus_auto_approve = focusAutoApprove;
 	const appleScript = normalizeAppleScript((source as any).apple_script ?? (source as any).appleScript);
 	if (appleScript) {
 		out.apple_script = { ...DEFAULT_APPLE_SCRIPT_CONFIG, ...appleScript };
@@ -144,8 +154,10 @@ function readEnv(): Partial<ComputerUseConfig> {
 	const out: Partial<ComputerUseConfig> = {};
 	const browserUse = parseBoolean(process.env.PI_COMPUTER_USE_BROWSER_USE);
 	const stealthMode = parseBoolean(process.env.PI_COMPUTER_USE_STEALTH_MODE);
+	const focusAutoApprove = parseBoolean(process.env.PI_COMPUTER_USE_FOCUS_AUTO_APPROVE);
 	if (browserUse !== undefined) out.browser_use = browserUse;
 	if (stealthMode !== undefined) out.stealth_mode = stealthMode;
+	if (focusAutoApprove !== undefined) out.focus_auto_approve = focusAutoApprove;
 	if (parseBoolean(process.env.PI_COMPUTER_USE_STEALTH) === true || parseBoolean(process.env.PI_COMPUTER_USE_STRICT_AX) === true) {
 		out.stealth_mode = true;
 	}
@@ -190,6 +202,10 @@ export function getLoadedComputerUseConfig(): LoadedComputerUseConfig {
 
 export function isStrictAxMode(): boolean {
 	return activeConfig.stealth_mode;
+}
+
+export function isFocusAutoApprove(): boolean {
+	return activeConfig.focus_auto_approve;
 }
 
 export function isBrowserUseEnabled(): boolean {
@@ -237,6 +253,7 @@ export function saveUserComputerUseConfig(update: Partial<ComputerUseConfig>): s
 	const merged: any = { ...flatExisting };
 	if (update.browser_use !== undefined) merged.browser_use = update.browser_use;
 	if (update.stealth_mode !== undefined) merged.stealth_mode = update.stealth_mode;
+	if (update.focus_auto_approve !== undefined) merged.focus_auto_approve = update.focus_auto_approve;
 	if (update.apple_script !== undefined) {
 		merged.apple_script = {
 			...(typeof flatExisting.apple_script === "object" && flatExisting.apple_script !== null ? flatExisting.apple_script : {}),
