@@ -1722,10 +1722,30 @@ final class Bridge {
 			windowRaised = (status == .success)
 		}
 
+		// Settle loop: after activate + AXRaise, the window-server takes a
+		// few hundred ms to commit the new on-screen state to CGWindowList
+		// and SCK. Without this, an immediate follow-up screenshot races
+		// the transition: CGWindowList still reports kCGWindowIsOnscreen=
+		// false, my new off-Space gate over-rejects, and SCK's
+		// captureImage hangs indefinitely (well past pi's 25s timeout).
+		// Poll every 50ms up to 2s for CGWindowList to agree the window is
+		// onscreen. Cheap when transition is fast; bounded when it isn't.
+		var settled = false
+		if let resolvedWindowId {
+			for _ in 0..<40 {
+				if let onscreen = isWindowOnscreen(windowId: resolvedWindowId), onscreen {
+					settled = true
+					break
+				}
+				Thread.sleep(forTimeInterval: 0.05)
+			}
+		}
+
 		var result: [String: Any] = [
 			"pid": Int(pid),
 			"appActivated": appActivated,
 			"windowRaised": windowRaised,
+			"settled": settled,
 		]
 		if let resolvedWindowId {
 			result["windowId"] = Int(resolvedWindowId)
@@ -2976,6 +2996,19 @@ final class Bridge {
 		return CGRect(origin: origin, size: size)
 	}
 
+	/// Single-window onscreen probe via CGWindowList. Returns nil when
+	/// the window isn't in CGWindowList (already gone). Returns true
+	/// when kCGWindowIsOnscreen is present and true; false otherwise
+	/// (off-Space, fully occluded, or minimized). Cheap: microseconds.
+	private func isWindowOnscreen(windowId: UInt32) -> Bool? {
+		guard let entries = CGWindowListCopyWindowInfo([.optionIncludingWindow, .optionAll], CGWindowID(windowId)) as? [[String: Any]],
+			let first = entries.first(where: { ((($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value) ?? 0) == windowId })
+		else {
+			return nil
+		}
+		return (first[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
+	}
+
 	private func cgWindowCandidates(pid: Int32) -> [CGWindowCandidate] {
 		guard let entries = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
 			return []
@@ -3093,6 +3126,42 @@ final class Bridge {
 	private func captureWindow(windowId: UInt32) throws -> [String: Any] {
 		guard #available(macOS 14.0, *) else {
 			throw BridgeFailure(message: "Window capture requires macOS 14+", code: "unsupported_os")
+		}
+
+		// Fast off-Space gate. SCScreenshotManager.captureImage hangs
+		// indefinitely (well past pi's 25s helper timeout, observed >30s)
+		// when the target window lives on a different macOS Space - the
+		// system never produces a frame because off-Space windows don't
+		// render. We can detect this in a single CGWindowList lookup
+		// (microseconds) and fail fast with a useful recovery message,
+		// rather than letting pi SIGTERM the helper.
+		//
+		// Brief retry to absorb the surface_window race: just after
+		// activate + AXRaise, CGWindowList can still report
+		// kCGWindowIsOnscreen=false for ~200-500ms while the window-server
+		// commits the transition. surfaceWindow already settles before
+		// returning, but the agent might call screenshot directly without
+		// going through surfaceWindow (e.g. user manually switched Spaces
+		// to bring the window forward). 6 polls @ 50ms = 300ms max latency
+		// when the window is genuinely off-Space - far cheaper than the
+		// 25s SIGTERM and matches what humans expect a "is it visible?"
+		// check to feel like.
+		var lastSeenOnscreen: Bool? = isWindowOnscreen(windowId: windowId)
+		if lastSeenOnscreen == false {
+			for _ in 0..<6 {
+				Thread.sleep(forTimeInterval: 0.05)
+				let probe = isWindowOnscreen(windowId: windowId)
+				if probe != false {
+					lastSeenOnscreen = probe
+					break
+				}
+			}
+		}
+		if lastSeenOnscreen == false {
+			throw BridgeFailure(
+				message: "Window \(windowId) is on a different macOS Space and cannot be screenshotted - SCScreenshotManager hangs on off-Space windows. Use wake_window({windowRef}) to see non-GUI alternatives (apple_script, app_instructions), or ask the user for permission and call surface_window({windowRef}) to bring the window forward, then retry screenshot.",
+				code: "window_off_active_space"
+			)
 		}
 
 		let semaphore = DispatchSemaphore(value: 0)
