@@ -26,13 +26,14 @@ interface ToolResultLike {
 import type {
 	AppleScriptDetails,
 	ComputerUseDetails,
+	LaunchAppDetails,
 	ListAppsDetails,
 	ListWindowsDetails,
 	SurfaceWindowDetails,
 	WakeWindowDetails,
 } from "../src/bridge.ts";
 
-type AnyDetails = ComputerUseDetails | ListAppsDetails | ListWindowsDetails | WakeWindowDetails | SurfaceWindowDetails | AppleScriptDetails | undefined;
+type AnyDetails = ComputerUseDetails | ListAppsDetails | ListWindowsDetails | WakeWindowDetails | SurfaceWindowDetails | LaunchAppDetails | AppleScriptDetails | undefined;
 
 interface ThemeLike {
 	bold: (s: string) => string;
@@ -178,6 +179,10 @@ function appOrTargetTag(toolName: string, details: AnyDetails): string | undefin
 			const d = details as SurfaceWindowDetails;
 			return d.window?.appName;
 		}
+		case "launch_app": {
+			const d = details as LaunchAppDetails;
+			return d.appName;
+		}
 		case "apple_script": {
 			const d = details as AppleScriptDetails;
 			return d.app;
@@ -225,6 +230,14 @@ function toolSummary(
 			if (d.appActivated) bits.push("app activated");
 			if (d.windowRaised) bits.push("window raised");
 			if (!bits.length) bits.push("no-op");
+			return bits.join(" \u00b7 ");
+		}
+		case "launch_app": {
+			const d = details as LaunchAppDetails;
+			const bits: string[] = [];
+			bits.push(d.alreadyRunning ? "already running" : "launched");
+			bits.push(d.activated ? "foreground" : "background");
+			bits.push(`pid ${d.pid}`);
 			return bits.join(" \u00b7 ");
 		}
 		case "apple_script": {

@@ -80,6 +80,22 @@ export interface SurfaceWindowParams {
 	pid?: number;
 }
 
+export interface LaunchAppParams {
+	bundleId?: string;
+	appName?: string;
+	activate?: boolean;
+}
+
+export interface LaunchAppDetails {
+	tool: "launch_app";
+	query: LaunchAppParams;
+	pid: number;
+	appName: string;
+	bundleId: string;
+	alreadyRunning: boolean;
+	activated: boolean;
+}
+
 export interface SurfaceWindowDetails {
 	tool: "surface_window";
 	query: SurfaceWindowParams;
@@ -1543,10 +1559,17 @@ function appMatchesWindowQuery(app: HelperApp, query: ListWindowsParams): boolea
 function formatModeMarker(): string {
 	const config = getComputerUseConfig();
 	const bits: string[] = [];
-	bits.push(`mode: ${config.stealth_mode ? "stealth (AX-only)" : "normal"}`);
+	bits.push(`mode: ${config.stealth_mode ? "stealth" : "normal"}`);
 	if (config.stealth_mode) {
-		bits.push("avoid: type_text, raw keypress without AX equivalent, arrange_window above frontmost");
-		bits.push("prefer: set_text(ref), AX-action keypresses (Enter/Escape/Tab/Space), navigate_browser, apple_script");
+		// Stealth model v2: stealth blocks SURPRISE FOCUS CHANGES, not
+		// input mechanism. Coordinate clicks, keypresses, type_text,
+		// scroll, drag all work via per-PID delivery. The only blocked
+		// ops are those that would surface a window without explicit
+		// user permission: surface_window (gated, asks user), launch_app
+		// with activate=true (gated, asks user), navigate_browser AppleScript
+		// (gated, agent should use Cmd+L + set_text + Enter instead).
+		bits.push("rule: don't change frontmost without user permission; everything else is allowed");
+		bits.push("focus-changing tools (need user permission): surface_window, launch_app({activate:true})");
 	}
 	bits.push(`apple_script: ${config.apple_script.enabled ? "enabled" : "disabled"}`);
 	bits.push(`browser_use: ${config.browser_use ? "allowed" : "blocked"}`);
@@ -1617,26 +1640,23 @@ async function restoreUserFocus(target: FrontmostResult, signal?: AbortSignal): 
 	await runAppleScript([`tell ${activateTarget} to activate`], signal).catch(() => undefined);
 }
 
-async function focusControlledWindow(target: ResolvedTarget, signal?: AbortSignal): Promise<void> {
-	// Defense in depth: this raises the target window above whatever the user is
-	// currently focused on. Stealth mode promises to never preempt the user, so
-	// callers must guard before reaching here. We re-check here so a future caller
-	// who forgets the gate cannot silently break the stealth contract.
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			`Cannot raise window '${target.windowTitle}' in stealth mode \u2014 stealth promises to leave the user's frontmost app and window untouched. Use AX-only paths (axPress/axSetValue) or run without PI_COMPUTER_USE_STEALTH.`,
-		);
-	}
-	const result = await bridgeCommand<FocusWindowResult>(
-		"focusWindow",
-		nativeWindowRequest(target),
-		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
+/**
+ * Stealth model v2 surfaces ZERO windows on its own. The only path
+ * that should change frontmost is surface_window, which the agent
+ * calls explicitly after asking the user for permission. Every other
+ * input op goes through CGEventPostToPid (per-PID delivery) which
+ * lands in the target app's event queue without raising the window
+ * or changing the user's frontmost.
+ *
+ * focusControlledWindow used to be the "raise the window before posting
+ * raw input" helper, gated on stealth. Under v2 it is dead - kept as a
+ * stub that throws so any straggler caller fails loudly instead of
+ * silently disturbing the user. All known callers have been removed.
+ */
+async function focusControlledWindow(_target: ResolvedTarget, _signal?: AbortSignal): Promise<void> {
+	throw new Error(
+		"focusControlledWindow is not part of stealth model v2. Input ops post via CGEventPostToPid; surface_window is the only sanctioned focus-change path.",
 	);
-	if (!toBoolean(result?.focused)) {
-		throw new Error(
-			`Unable to focus controlled window '${target.windowTitle}' before input${result?.reason ? `: ${result.reason}` : "."}`,
-		);
-	}
 }
 
 function isBrowserApp(appName: string, bundleId?: string): boolean {
@@ -2615,12 +2635,14 @@ async function dispatchClick(
 	}
 
 	if (!clickedViaAX && !focusedViaAX) {
-		if (isStrictAxMode()) {
-			strictModeBlock(
-				`AX click/focus could not be completed at (${Math.round(x)},${Math.round(y)}).`,
-				"call screenshot to refresh AX targets, then click({ ref }) on the matching @eN — coordinate clicks only succeed in stealth when an AX element is grounded under the point",
-			);
-		}
+		// Stealth no longer blocks coordinate clicks. The native helper
+		// posts via CGEventPostToPid (per-PID delivery), so the click
+		// lands in the target app's queue without changing the user's
+		// frontmost. Webview content (Electron, Catalyst) is the
+		// motivating case: AX cannot ground these clicks, but the
+		// underlying renderer accepts the synthetic event. The stealth
+		// contract is now "no surprise focus changes", not "no
+		// synthesized input."
 		await bridgeCommand(
 			"mouseClick",
 			{
@@ -2661,23 +2683,19 @@ async function dispatchTypeText(text: string, target: ResolvedTarget, signal?: A
 			return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 		}
 	}
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			"Raw text insertion is not AX-only.",
-			"set_text({ ref, text }) on a text AX target from the latest screenshot replaces the value via AX without requiring keyboard focus",
-		);
-	}
-	await focusControlledWindow(target, signal);
+	// Stealth v2: post the keystrokes via per-PID delivery. set_text
+	// with an AX ref is still preferred; this raw path is the fallback
+	// for fields that don't expose AX values (Electron webview content
+	// is the motivating case).
 	await bridgeCommand(
 		"typeText",
 		{ text, pid: target.pid },
 		{ signal, timeoutMs: Math.min(90_000, Math.max(COMMAND_TIMEOUT_MS, text.length * 25 + 4_000)) },
 	);
-	return executionTrace("raw_key_text", "default", {
+	return executionTrace("raw_key_text", "stealth", {
 		axAttempted: false,
 		axSucceeded: false,
 		fallbackUsed: false,
-		nonStealthReason: "raw_text_insertion_requires_keyboard_focus",
 	});
 }
 
@@ -2731,18 +2749,15 @@ async function dispatchSetText(params: SetTextParams, target: ResolvedTarget, si
 						return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 					}
 				}
-				if (isStrictAxMode()) {
-					throw normalizeError(error);
-				}
+				// Stealth v2: fall through to focus + setValue path (which
+				// does not raise the window). The original strict-mode
+				// rejection is gone because v2 trusts per-PID delivery.
 			}
 		}
 
-		if (isStrictAxMode()) {
-			strictModeBlock(
-				`AX target '${ref}' does not expose a directly settable AX value.`,
-				"pick a different ref from the latest screenshot whose actions list includes setValue, or click({ ref }) the field first to focus it and try again",
-			);
-		}
+		// Stealth v2: try the focus + setValue path before giving up.
+		// focusAxElement focuses an AX element via AXFocusedAttribute,
+		// which does NOT raise the parent window.
 
 		let focusedViaRef = await focusAxElement(axTarget.elementRef, target, signal);
 		if (!focusedViaRef) {
@@ -2771,25 +2786,15 @@ async function dispatchSetText(params: SetTextParams, target: ResolvedTarget, si
 		return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			"set_text in stealth mode requires a text AX ref from the latest screenshot or an already-focused text control.",
-			"call screenshot to refresh AX targets, then set_text({ ref, text }) using a ref whose role is AXTextField/AXTextArea/AXSearchField/AXComboBox",
-		);
-	}
-
-	await focusControlledWindow(target, signal);
-	const focusedAfterWindowFocus = await focusedTextElementRef(target, signal);
-	if (!focusedAfterWindowFocus) {
-		throw new Error("AX value replacement requires a text AX ref or focused text control. Use set_text with ref from the latest screenshot when available.");
-	}
-	await setAxValue(focusedAfterWindowFocus, params.text, signal);
-	return executionTrace("ax_set_value", "default", {
-		axAttempted: true,
-		axSucceeded: true,
-		fallbackUsed: true,
-		nonStealthReason: "set_text_without_ref_requires_window_focus_fallback",
-	});
+	// Stealth v2: no AX text target found, no currently-focused text
+	// control. Rather than raising the window (forbidden under v2), we
+	// surface a clear error pointing the agent at click({ x, y }) +
+	// type_text({ text }) - both of which now use per-PID delivery and
+	// don't disturb the user. This path is for callers that asked
+	// set_text without a ref.
+	throw new Error(
+		"set_text needs a text AX ref or an already-focused text control. Either: (a) call screenshot to refresh AX targets and pass a ref whose role is AXTextField/AXTextArea/AXSearchField/AXComboBox, or (b) click({ x, y }) on the field to focus it (per-PID delivery), then call set_text again.",
+	);
 }
 
 function isCommandL(keys: string[]): boolean {
@@ -2931,27 +2936,17 @@ async function dispatchKeypress(params: KeypressParams, target: ResolvedTarget, 
 	// or change the frontmost app. That's mechanically stealth-safe — the
 	// same primitive OpenAI's Sky CUA helper uses for the same reason.
 	//
-	// We deliberately skip focusControlledWindow() here in stealth mode: that
-	// call would raise the target window above the user's frontmost (a real
-	// stealth-contract violation). The trade-off is keypress becomes
-	// best-effort for apps that gate input on foreground status. Empirically
-	// Slack/Electron, Chrome, and most modern apps accept postToPid events
-	// without being foreground; some legacy AppKit apps may not.
-	if (isStrictAxMode()) {
-		await bridgeCommand("keyPress", { keys, pid: target.pid }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
-		return executionTrace("per_pid_keypress", "stealth", {
-			axAttempted: semanticActionsForKeys(keys).length > 0,
-			axSucceeded: false,
-			fallbackUsed: semanticActionsForKeys(keys).length > 0,
-		});
-	}
-	await focusControlledWindow(target, signal);
+	// Stealth v2: per-PID delivery is the keypress path. The helper
+	// posts via CGEventPostToPid which lands in the target app's queue
+	// without changing frontmost. We never raise the window pre-input;
+	// if the app gates keypress on foreground (some legacy AppKit apps
+	// do), the input is best-effort. Modern apps (Electron/Catalyst/
+	// Cocoa) honor per-PID keystrokes whether or not foreground.
 	await bridgeCommand("keyPress", { keys, pid: target.pid }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
-	return executionTrace("raw_keypress", "default", {
+	return executionTrace("per_pid_keypress", "stealth", {
 		axAttempted: semanticActionsForKeys(keys).length > 0,
 		axSucceeded: false,
 		fallbackUsed: semanticActionsForKeys(keys).length > 0,
-		nonStealthReason: "keypress_requires_keyboard_focus",
 	});
 }
 
@@ -3036,12 +3031,8 @@ async function dispatchScroll(
 	}
 
 	const reasonText = scrollAttempt.reason ? ` Reason: ${scrollAttempt.reason}.` : "";
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			ref ? `AX scroll could not be completed for ${ref}.${reasonText}` : `AX scroll could not be completed at (${Math.round(x)},${Math.round(y)}).${reasonText}`,
-			"refresh the screenshot and look for an AX target whose actions include scroll (typically AXScrollArea); pass that ref to scroll({ ref, scrollY })",
-		);
-	}
+	// Stealth v2: coordinate-scroll fallback is allowed - it posts via
+	// per-PID delivery and does not raise the target window.
 	if (!Number.isFinite(x) || !Number.isFinite(y)) {
 		throw new Error(`Coordinate scroll fallback requires x and y.${reasonText} Provide coordinates from the latest screenshot or use a current AX scroll target.`);
 	}
@@ -3073,12 +3064,10 @@ async function dispatchMoveMouse(
 	target: ResolvedTarget,
 	signal?: AbortSignal,
 ): Promise<ExecutionTrace> {
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			"Mouse movement is not AX-only and would warp the user's cursor.",
-			"there's no AX equivalent for hover; if you need to trigger a hover-revealed UI, click({ ref }) on the underlying control instead, or ask the user to enable hover manually",
-		);
-	}
+	// Stealth v2: mouseMove posts a synthetic .mouseMoved event via
+	// CGEventPostToPid - it does NOT call CGWarpMouseCursorPosition, so
+	// the user's actual cursor is unaffected. The agent's overlay
+	// cursor follows the synthetic position. Allowed in stealth.
 	const x = toFiniteNumber(params.x, NaN);
 	const y = toFiniteNumber(params.y, NaN);
 	ensurePointIsInCapture(x, y, capture);
@@ -3145,14 +3134,8 @@ async function dispatchDrag(
 	if (adjustedViaAX) {
 		return executionTrace("ax_action", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			ref ? `AX adjustment could not be completed for ${ref}.` : "Drag is not AX-only.",
-			ref
-				? "the ref's role may not support increment/decrement — pick an AXSlider/AXScrollBar from the screenshot, or use scroll({ ref }) for content panes"
-				: "there's no AX equivalent for arbitrary dragging; if the goal is reordering or selection, look for app-specific buttons in the screenshot, or ask the user",
-		);
-	}
+	// Stealth v2: coordinate drag is allowed - per-PID delivery, no
+	// window raise.
 	if (!path) {
 		throw new Error("drag requires path points for pointer fallback or a ref plus path for AX adjustment.");
 	}
@@ -3929,6 +3912,65 @@ async function performSurfaceWindow(params: SurfaceWindowParams, signal?: AbortS
 	const text = appActivated || windowRaised
 		? `Surfaced ${label} (${statusBits.join(", ")}). The user's viewport may have switched. Call screenshot to inspect the window now that it's on the active Space.`
 		: `Could not surface ${label} (${statusBits.join(", ")}). The window may already be on the active Space, or the app refused the request.`;
+
+	return { content: [{ type: "text", text }], details };
+}
+
+export async function executeLaunchApp(
+	_toolCallId: string,
+	params: LaunchAppParams,
+	signal: AbortSignal | undefined,
+	_onUpdate: AgentToolUpdateCallback<LaunchAppDetails> | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<LaunchAppDetails>> {
+	return await executeTool(ctx, signal, () => performLaunchApp(params, signal));
+}
+
+async function performLaunchApp(params: LaunchAppParams, signal?: AbortSignal): Promise<AgentToolResult<LaunchAppDetails>> {
+	const rawParams = params ?? {};
+	const bundleId = trimOrUndefined(rawParams.bundleId);
+	const appName = trimOrUndefined(rawParams.appName);
+	const activate = !!rawParams.activate;
+
+	if (!bundleId && !appName) {
+		throw new Error("launch_app requires bundleId or appName.");
+	}
+
+	// Stealth v2: launching with activate=false is always safe (the
+	// app starts in the background, no surprise focus change).
+	// Launching with activate=true would steal focus, so it has the
+	// same gate as surface_window: agent must ask user permission
+	// first. Refuse here so the agent gets a clean error pointing it
+	// at the right pattern; outside stealth, activation is allowed
+	// because the user opted out of the contract.
+	if (activate && isStrictAxMode()) {
+		throw new Error(
+			"launch_app({ activate: true }) would steal focus and is gated in stealth mode for the same reason as surface_window. Either: (a) launch with activate=false (background launch is always allowed), then ask the user for permission and call surface_window if you need the app foreground, or (b) ask the user for permission first, then launch with activate=true.",
+		);
+	}
+
+	const payload: Record<string, unknown> = { activate };
+	if (bundleId) payload.bundleId = bundleId;
+	if (appName) payload.appName = appName;
+
+	const result = await bridgeCommand<any>("launchApp", payload, { signal, timeoutMs: 12_000 });
+	const pid = Math.trunc(result?.pid ?? 0);
+	const details: LaunchAppDetails = {
+		tool: "launch_app",
+		query: rawParams,
+		pid,
+		appName: typeof result?.appName === "string" ? result.appName : appName ?? "",
+		bundleId: typeof result?.bundleId === "string" ? result.bundleId : bundleId ?? "",
+		alreadyRunning: toBoolean(result?.alreadyRunning),
+		activated: toBoolean(result?.activated),
+	};
+
+	const statusBits: string[] = [];
+	if (details.alreadyRunning) statusBits.push("already running");
+	else statusBits.push("launched");
+	if (details.activated) statusBits.push("activated (foreground)");
+	else statusBits.push("background");
+	const text = `${statusBits[0]}: ${details.appName} (pid ${details.pid}, bundleId ${details.bundleId})${details.activated ? " \u2014 user's viewport may have changed" : ""}. Use pid ${details.pid} with screenshot/list_windows to inspect the app.`;
 
 	return { content: [{ type: "text", text }], details };
 }

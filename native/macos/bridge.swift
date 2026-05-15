@@ -1097,6 +1097,8 @@ final class Bridge {
 			return try wakeWindow(request)
 		case "surfaceWindow":
 			return try surfaceWindow(request)
+		case "launchApp":
+			return try launchApp(request)
 		case "getFrontmost":
 			return try getFrontmost()
 		case "getUserContext":
@@ -1729,6 +1731,91 @@ final class Bridge {
 			result["windowId"] = Int(resolvedWindowId)
 		}
 		return result
+	}
+
+	/// Launch an app, optionally without stealing focus. Stealth model v2
+	/// allows the agent to launch background-runnable apps freely; if it
+	/// wants the app foreground, it should ask the user first via the
+	/// permission gate enforced by the TS layer.
+	///
+	/// Looks up the app by bundleId first, then by appName. Uses
+	/// NSWorkspace.openApplication(at:configuration:) with activates set
+	/// per the request. Returns the launched (or already-running) pid so
+	/// the agent can immediately call screenshot/list_windows/etc.
+	private func launchApp(_ request: [String: Any]) throws -> [String: Any] {
+		let bundleId = optionalStringArg(request, "bundleId")
+		let appName = optionalStringArg(request, "appName")
+		let activate = (request["activate"] as? NSNumber)?.boolValue ?? false
+
+		var appURL: URL? = nil
+		if let bundleId, !bundleId.isEmpty {
+			appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId)
+		}
+		if appURL == nil, let appName, !appName.isEmpty {
+			if let path = NSWorkspace.shared.fullPath(forApplication: appName) {
+				appURL = URL(fileURLWithPath: path)
+			}
+		}
+		guard let appURL else {
+			throw BridgeFailure(
+				message: "launchApp could not resolve an app to launch. Provide bundleId (e.g. 'com.apple.TextEdit') or appName (e.g. 'TextEdit'); both must match an installed app.",
+				code: "app_not_found"
+			)
+		}
+
+		let resolvedBundleId = Bundle(url: appURL)?.bundleIdentifier ?? bundleId
+
+		// If the app is already running, short-circuit and return the
+		// existing pid. Honors the activate flag: if the caller asked
+		// to activate and the app is already running, we still raise it.
+		let running = NSRunningApplication.runningApplications(withBundleIdentifier: resolvedBundleId ?? "")
+		if let existing = running.first {
+			var didActivate = false
+			if activate {
+				didActivate = existing.activate(options: [])
+			}
+			return [
+				"pid": Int(existing.processIdentifier),
+				"appName": existing.localizedName ?? appName ?? appURL.lastPathComponent,
+				"bundleId": existing.bundleIdentifier ?? "",
+				"alreadyRunning": true,
+				"activated": didActivate,
+			]
+		}
+
+		let config = NSWorkspace.OpenConfiguration()
+		config.activates = activate
+		config.addsToRecentItems = false
+
+		let sema = DispatchSemaphore(value: 0)
+		var launchedApp: NSRunningApplication? = nil
+		var launchError: Error? = nil
+		NSWorkspace.shared.openApplication(at: appURL, configuration: config) { app, error in
+			launchedApp = app
+			launchError = error
+			sema.signal()
+		}
+		// 10s budget for launches; matches the helper's COMMAND_TIMEOUT_MS
+		// behavior on the TS side. NSWorkspace.openApplication can stall
+		// briefly during cold launches but a hung app should fail loudly.
+		let waitResult = sema.wait(timeout: .now() + .seconds(10))
+		if waitResult == .timedOut {
+			throw BridgeFailure(message: "launchApp timed out waiting for the app to launch.", code: "launch_timeout")
+		}
+		if let launchError {
+			throw BridgeFailure(message: "launchApp failed: \(launchError.localizedDescription)", code: "launch_failed")
+		}
+		guard let launchedApp else {
+			throw BridgeFailure(message: "launchApp returned no NSRunningApplication.", code: "launch_failed")
+		}
+
+		return [
+			"pid": Int(launchedApp.processIdentifier),
+			"appName": launchedApp.localizedName ?? appName ?? appURL.lastPathComponent,
+			"bundleId": launchedApp.bundleIdentifier ?? "",
+			"alreadyRunning": false,
+			"activated": activate,
+		]
 	}
 
 	/// Shared resolver for wakeWindow / surfaceWindow. Returns the
