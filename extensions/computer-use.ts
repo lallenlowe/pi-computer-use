@@ -11,6 +11,7 @@ import {
 	executeDoubleClick,
 	executeDrag,
 	executeKeypress,
+	executeLaunchApp,
 	executeListApps,
 	executeListWindows,
 	executeSurfaceWindow,
@@ -30,6 +31,7 @@ import {
 	type ComputerActionsParams,
 	type DragParams,
 	type KeypressParams,
+	type LaunchAppParams,
 	type ListWindowsParams,
 	type SurfaceWindowParams,
 	type WakeWindowParams,
@@ -133,6 +135,29 @@ const wakeWindowTool = defineTool(withCompactRendering({
 	}),
 	async execute(toolCallId, params: WakeWindowParams, signal, onUpdate, ctx) {
 		return await executeWakeWindow(toolCallId, params, signal, onUpdate, ctx);
+	},
+}));
+
+const launchAppTool = defineTool(withCompactRendering({
+	name: "launch_app",
+	label: "Launch App",
+	description: "Launch an app by bundleId or appName. Defaults to background launch (no focus change). Returns the pid for immediate use with screenshot/list_windows.",
+	promptSnippet: "Launch a macOS app. Background by default; pass activate=true to bring it foreground (requires user permission in stealth).",
+	promptGuidelines: [
+		"Use this when an app the agent wants to control isn't currently running. Pass bundleId (preferred, e.g. 'com.apple.TextEdit') or appName (e.g. 'TextEdit').",
+		"Default activate=false launches in the background without changing the user's frontmost. Always safe under stealth.",
+		"Pass activate=true to bring the app foreground; in stealth this requires explicit user permission first ('Need to bring <App> forward to do <task>; OK?'). Outside stealth, activation is allowed.",
+		"After a successful launch, use the returned pid with screenshot({ pid }) or list_windows({ pid }) - no need for an extra discovery round-trip.",
+		"If the app is already running, this returns alreadyRunning=true with the existing pid; no second instance is started.",
+	],
+	executionMode: "sequential",
+	parameters: Type.Object({
+		bundleId: Type.Optional(Type.String({ description: "App bundle identifier (preferred), e.g. 'com.apple.TextEdit'." })),
+		appName: Type.Optional(Type.String({ description: "App display name, e.g. 'TextEdit'. Used when bundleId is unknown." })),
+		activate: Type.Optional(Type.Boolean({ description: "Whether to bring the app foreground on launch. Default false (background, stealth-safe). True requires user permission in stealth." })),
+	}),
+	async execute(toolCallId, params: LaunchAppParams, signal, onUpdate, ctx) {
+		return await executeLaunchApp(toolCallId, params, signal, onUpdate, ctx);
 	},
 }));
 
@@ -782,6 +807,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 	try {
 		pi.registerTool(listAppsTool);
 		pi.registerTool(listWindowsTool);
+		pi.registerTool(launchAppTool);
 		pi.registerTool(wakeWindowTool);
 		pi.registerTool(surfaceWindowTool);
 		pi.registerTool(screenshotTool);
