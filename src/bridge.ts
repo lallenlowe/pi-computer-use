@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getComputerUseConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
 import { ensurePermissions, type PermissionStatus } from "./permissions.ts";
+import { loadAppInstructions, type AppInstructions } from "./app-instructions.ts";
 
 type WindowSelector = string | number;
 type ImageMode = "auto" | "always" | "never";
@@ -219,6 +220,12 @@ export interface ComputerUseDetails {
 		| "unlabeled_ax_targets"
 		| "duplicated_ax_labels"
 		| "browser_wait_verification";
+	/**
+	 * Hand-written guidance for this app, when an instructions file matches the
+	 * target's bundle id or display name. Additive hint layer; absence is
+	 * normal and the model should proceed using AX targets and screenshots.
+	 */
+	appInstructions?: AppInstructions;
 }
 
 export interface ListAppsDetails {
@@ -2231,11 +2238,33 @@ async function buildToolResult(
 		config: getComputerUseConfig(),
 		imageReason: fallbackReason?.reason,
 	};
+
+	// Per-app instructions. Only inject on screenshot results — that's the
+	// "you're now looking at this app" moment. Repeating on every action would
+	// burn tokens for no new info. Absence of a file is normal and silent.
+	let appInstructionsText = "";
+	if (tool === "screenshot") {
+		try {
+			const instructions = await loadAppInstructions({
+				bundleId: result.target.bundleId,
+				appName: result.target.appName,
+			});
+			if (instructions) {
+				details.appInstructions = instructions;
+				const headerNote = instructions.source === "user" ? "user override" : "bundled";
+				const truncatedNote = instructions.truncated ? ", truncated to ~3KB" : "";
+				appInstructionsText = `\n\n--- App-specific instructions for ${result.target.appName} (${headerNote}${truncatedNote}) ---\n${instructions.text}\n--- end instructions ---`;
+			}
+		} catch {
+			// Loader is best-effort. Never block a tool result on instruction lookup.
+		}
+	}
+
 	const axTargetText = result.axTargets.length
 		? `\n\nPrefer these AX targets over coordinate clicks or focus-based text replacement when one matches your intent:\n${result.axTargets.map(formatAxTargetLabel).join("\n")}`
 		: "";
 	const fallbackText = fallbackReason ? `\n\n${fallbackReason.message}` : "";
-	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${summary}${axTargetText}${fallbackText}` }];
+	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${summary}${axTargetText}${fallbackText}${appInstructionsText}` }];
 	if (fallbackReason) {
 		content.push({ type: "image", data: result.image!.pngBase64, mimeType: "image/png" });
 	}

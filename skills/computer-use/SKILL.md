@@ -39,6 +39,7 @@ Use these tools when shell/file tools are not enough and you need to operate a m
 - Default mode has built-in screenshot/vision grounding and is AX-first with fallback only when a control cannot be completed semantically.
 - Opt-in stealth mode (`PI_COMPUTER_USE_STEALTH=1` or `PI_COMPUTER_USE_STRICT_AX=1`) exposes the widest safe subset: AX/background-safe operations run, but non-AX fallbacks are blocked.
 - In stealth mode, operation must stay background-safe: no second screen or virtual display, no foreground activation, no raw keyboard/pointer events, and no physical cursor takeover.
+- If a `screenshot` result includes an `--- App-specific instructions for ... ---` block, prefer the guidance there over generic heuristics for that app. The instructions are hand-written for surprising behaviors (selection rules, modifier conventions, irreversible actions) the AX tree alone won't tell you about. Apps without instructions are normal — work it out from AX targets and the screenshot as usual.
 
 ## When errors happen
 
