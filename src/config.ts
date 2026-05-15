@@ -18,6 +18,8 @@ export interface AppleScriptConfig {
 export interface OverlayConfig {
 	enabled: boolean;
 	size: number;
+	animation_style: "arc" | "linear" | "off";
+	animation_duration_ms: number;
 }
 
 export interface ComputerUseConfigSource {
@@ -42,6 +44,8 @@ const DEFAULT_APPLE_SCRIPT_CONFIG: AppleScriptConfig = {
 const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
 	enabled: false,
 	size: 28,
+	animation_style: "arc",
+	animation_duration_ms: 180,
 };
 
 const DEFAULT_CONFIG: ComputerUseConfig = {
@@ -73,6 +77,17 @@ function normalizeOverlay(raw: unknown): Partial<OverlayConfig> | undefined {
 	const size = src.size;
 	if (typeof size === "number" && Number.isFinite(size) && size > 0) {
 		out.size = Math.trunc(size);
+	}
+	const rawStyle = (src.animation_style ?? src.animationStyle);
+	if (typeof rawStyle === "string") {
+		const lowered = rawStyle.toLowerCase();
+		if (lowered === "arc" || lowered === "linear" || lowered === "off") {
+			out.animation_style = lowered;
+		}
+	}
+	const durationMs = src.animation_duration_ms ?? src.animationDurationMs;
+	if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0) {
+		out.animation_duration_ms = Math.trunc(durationMs);
 	}
 	return Object.keys(out).length > 0 ? out : undefined;
 }
