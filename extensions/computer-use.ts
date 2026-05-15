@@ -17,7 +17,6 @@ import {
 	executeSurfaceWindow,
 	executeWakeWindow,
 	executeMoveMouse,
-	executeNavigateBrowser,
 	executeScroll,
 	executeSetText,
 	executeScreenshot,
@@ -36,7 +35,6 @@ import {
 	type SurfaceWindowParams,
 	type WakeWindowParams,
 	type MoveMouseParams,
-	type NavigateBrowserParams,
 	type ScreenshotParams,
 	type ScrollParams,
 	type SetTextParams,
@@ -193,7 +191,7 @@ const screenshotTool = defineTool(withCompactRendering({
 		"If screenshot returns AX targets, prefer refs for click and set_text before coordinate or focus-based actions.",
 		"Call screenshot(app, windowTitle) to switch the controlled window.",
 		"For browsers, prefer a separate window for agent work instead of opening a new tab in the user's current window.",
-		"In strict AX mode, do not bootstrap a new browser window; target an existing dedicated browser window instead.",
+		"There is no automatic browser-window bootstrap - target an existing browser window, or ask the user to open one.",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({
@@ -449,26 +447,6 @@ const arrangeWindowTool = defineTool(withCompactRendering({
 	}),
 	async execute(toolCallId, params: ArrangeWindowParams, signal, onUpdate, ctx) {
 		return await executeArrangeWindow(toolCallId, params, signal, onUpdate, ctx);
-	},
-}));
-
-const navigateBrowserTool = defineTool(withCompactRendering({
-	name: "navigate_browser",
-	label: "Navigate Browser",
-	description: "Navigate a target browser window directly to a URL or search string without relying on address-bar keyboard focus.",
-	promptSnippet: "Navigate a browser window directly to a URL using a window ref like @w1.",
-	promptGuidelines: [
-		"Use this for browser navigation instead of Command+L/type_text/Enter when you know the destination URL.",
-		"Pass an explicit window ref from list_windows when the browser has multiple windows.",
-	],
-	executionMode: "sequential",
-	parameters: Type.Object({
-		url: Type.String({ description: "URL or browser-search string to open" }),
-		window: windowSelectorSchema,
-		image: imageModeSchema,
-	}),
-	async execute(toolCallId, params: NavigateBrowserParams, signal, onUpdate, ctx) {
-		return await executeNavigateBrowser(toolCallId, params, signal, onUpdate, ctx);
 	},
 }));
 
@@ -821,7 +799,6 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 		pi.registerTool(setTextTool);
 		pi.registerTool(waitTool);
 		pi.registerTool(arrangeWindowTool);
-		pi.registerTool(navigateBrowserTool);
 		pi.registerTool(computerActionsTool);
 		pi.registerTool(appleScriptTool);
 	} catch (error) {

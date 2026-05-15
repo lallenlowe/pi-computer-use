@@ -178,10 +178,6 @@ export interface ArrangeWindowParams extends WindowTargetParams {
 	preset?: "center_large" | "left_half" | "right_half" | "top_half" | "bottom_half";
 }
 
-export interface NavigateBrowserParams extends WindowTargetParams {
-	url: string;
-}
-
 export interface WaitParams extends WindowTargetParams {
 	ms?: number;
 }
@@ -411,14 +407,6 @@ interface FrontmostResult {
 	windowId?: number;
 }
 
-interface RestoreUserFocusResult {
-	restored: boolean;
-	appRestored?: boolean;
-	windowRestored?: boolean;
-	appName?: string;
-	windowTitle?: string;
-}
-
 interface ScreenshotPayload {
 	pngBase64: string;
 	width: number;
@@ -513,12 +501,6 @@ interface AxTarget {
 	score?: number;
 }
 
-interface PendingBrowserAddress {
-	text: string;
-	pid: number;
-	windowId: number;
-}
-
 interface WindowRefRecord {
 	ref: string;
 	appName: string;
@@ -547,7 +529,6 @@ interface RuntimeState {
 	windowWriteQueues: Map<string, Promise<void>>;
 	nextWindowRefIndex: number;
 	allowNextTypeTextAxReplacement?: boolean;
-	pendingBrowserAddress?: PendingBrowserAddress;
 	helper?: ChildProcessWithoutNullStreams;
 	helperStdoutBuffer: string;
 	pending: Map<string, PendingRequest>;
@@ -587,7 +568,6 @@ const TOOL_NAMES = new Set([
 	"set_text",
 	"wait",
 	"arrange_window",
-	"navigate_browser",
 	"computer_actions",
 	"apple_script",
 ]);
@@ -654,10 +634,6 @@ const CHROME_FAMILY_APP_NAMES = new Set([
 	"vivaldi",
 	"helium",
 ]);
-const BROWSER_WINDOW_OPEN_TIMEOUT_MS = 10_000;
-const BROWSER_WINDOW_OPEN_POLL_MS = 200;
-const BROWSER_WINDOW_OPEN_ATTEMPTS = 12;
-
 export const HELPER_STABLE_PATH = path.join(os.homedir(), ".pi", "agent", "helpers", "pi-computer-use", "bridge");
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -693,28 +669,6 @@ class HelperCommandError extends Error {
 		this.name = "HelperCommandError";
 		this.code = code;
 	}
-}
-
-const BROWSER_JAVASCRIPT_APPLE_EVENTS_HINT = [
-	"Browser JavaScript Apple Events are disabled for the target browser.",
-	"Ask the user to enable \"Allow JavaScript from Apple Events\" in the browser's developer menu, then retry the browser action.",
-].join(" ");
-
-function isBrowserJavaScriptAppleEventsErrorMessage(message: string): boolean {
-	return /not allowed to send javascript commands/i.test(message)
-		|| /executing javascript through applescript is turned off/i.test(message)
-		|| /allow javascript from apple events/i.test(message)
-		|| /enable javascript from apple events/i.test(message)
-		|| (/javascript/i.test(message) && /apple events/i.test(message));
-}
-
-function appendBrowserJavaScriptAppleEventsHint(error: Error): Error {
-	if (!isBrowserJavaScriptAppleEventsErrorMessage(error.message) || error.message.includes(BROWSER_JAVASCRIPT_APPLE_EVENTS_HINT)) {
-		return error;
-	}
-	const enhanced = new Error(`${error.message}\n\n${BROWSER_JAVASCRIPT_APPLE_EVENTS_HINT}`);
-	enhanced.name = error.name;
-	return enhanced;
 }
 
 function normalizeError(error: unknown): Error {
@@ -1613,8 +1567,9 @@ function formatModeMarker(): string {
 		// scroll, drag all work via per-PID delivery. The only blocked
 		// ops are those that would surface a window without explicit
 		// user permission: surface_window (gated, asks user), launch_app
-		// with activate=true (gated, asks user), navigate_browser AppleScript
-		// (gated, agent should use Cmd+L + set_text + Enter instead).
+		// with activate=true (gated, asks user).
+		// (Browser address-bar navigation is just the regular AX-only path:
+		// keypress Command+L, set_text the URL, keypress Enter.)
 		bits.push("rule: don't change frontmost without user permission; everything else is allowed");
 		bits.push("focus-changing tools (need user permission): surface_window, launch_app({activate:true})");
 	}
@@ -1662,49 +1617,11 @@ async function getFrontmost(signal?: AbortSignal): Promise<FrontmostResult> {
 	};
 }
 
-async function beginInputSuppression(signal?: AbortSignal): Promise<void> {
-	await bridgeCommand("beginInputSuppression", {}, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
-}
-
-async function endInputSuppression(signal?: AbortSignal): Promise<void> {
-	await bridgeCommand("endInputSuppression", {}, { signal, timeoutMs: COMMAND_TIMEOUT_MS }).catch(() => undefined);
-}
-
-async function restoreUserFocus(target: FrontmostResult, signal?: AbortSignal): Promise<void> {
-	const restoreResult = await bridgeCommand<RestoreUserFocusResult>(
-		"restoreUserFocus",
-		{ pid: target.pid, windowTitle: target.windowTitle },
-		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
-	).catch(() => undefined);
-
-	if (isStrictAxMode() || toBoolean(restoreResult?.windowRestored) || toBoolean(restoreResult?.appRestored)) {
-		return;
-	}
-
-	const activateTarget = target.bundleId
-		? `application id "${escapeAppleScriptString(target.bundleId)}"`
-		: `application "${escapeAppleScriptString(target.appName)}"`;
-	await runAppleScript([`tell ${activateTarget} to activate`], signal).catch(() => undefined);
-}
-
-/**
- * Stealth model v2 surfaces ZERO windows on its own. The only path
- * that should change frontmost is surface_window, which the agent
- * calls explicitly after asking the user for permission. Every other
- * input op goes through CGEventPostToPid (per-PID delivery) which
- * lands in the target app's event queue without raising the window
- * or changing the user's frontmost.
- *
- * focusControlledWindow used to be the "raise the window before posting
- * raw input" helper, gated on stealth. Under v2 it is dead - kept as a
- * stub that throws so any straggler caller fails loudly instead of
- * silently disturbing the user. All known callers have been removed.
- */
-async function focusControlledWindow(_target: ResolvedTarget, _signal?: AbortSignal): Promise<void> {
-	throw new Error(
-		"focusControlledWindow is not part of stealth model v2. Input ops post via CGEventPostToPid; surface_window is the only sanctioned focus-change path.",
-	);
-}
+// NOTE: focusControlledWindow used to live here and raise the controlled
+// window before posting raw input. Under stealth model v2 every input op
+// posts per-PID via CGEventPostToPid (no raise needed) and surface_window is
+// the only sanctioned focus-change path. The helper was kept as a throwing
+// stub for one slice; nothing calls it now, so it has been removed.
 
 function isBrowserApp(appName: string, bundleId?: string): boolean {
 	return BROWSER_BUNDLE_IDS.has(bundleId ?? "") || BROWSER_APP_NAMES.has(normalizeText(appName));
@@ -1796,132 +1713,6 @@ function storeWindowRefForAppWindow(app: HelperApp, window: HelperWindow): Windo
 
 function escapeAppleScriptString(value: string): string {
 	return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-}
-
-function buildBrowserNewWindowAppleScript(app: HelperApp): string[] | undefined {
-	const normalizedName = normalizeText(app.appName);
-	const target = app.bundleId
-		? `application id "${escapeAppleScriptString(app.bundleId)}"`
-		: `application "${escapeAppleScriptString(app.appName)}"`;
-
-	if (app.bundleId === "com.apple.Safari" || normalizedName === "safari") {
-		return [`tell ${target} to make new document`];
-	}
-
-	if (CHROME_FAMILY_BUNDLE_IDS.has(app.bundleId ?? "") || CHROME_FAMILY_APP_NAMES.has(normalizedName)) {
-		return [`tell ${target} to make new window`];
-	}
-
-	if (app.bundleId === "org.mozilla.firefox" || normalizedName === "firefox") {
-		return [
-			`tell ${target} to activate`,
-			'tell application "System Events" to keystroke "n" using command down',
-		];
-	}
-
-	return undefined;
-}
-
-async function runAppleScript(lines: string[], signal?: AbortSignal): Promise<void> {
-	const args = lines.flatMap((line) => ["-e", line]);
-	try {
-		await runProcess("osascript", args, BROWSER_WINDOW_OPEN_TIMEOUT_MS, signal);
-	} catch (error) {
-		throw appendBrowserJavaScriptAppleEventsHint(normalizeError(error));
-	}
-}
-
-function browserOpenLocationAppleScript(target: ResolvedTarget, url: string): string[] | undefined {
-	if (!isBrowserApp(target.appName, target.bundleId)) return undefined;
-	const appTarget = target.bundleId
-		? `application id "${escapeAppleScriptString(target.bundleId)}"`
-		: `application "${escapeAppleScriptString(target.appName)}"`;
-	const escapedUrl = escapeAppleScriptString(url);
-	const normalizedName = normalizeText(target.appName);
-	if (target.bundleId === "com.apple.Safari" || normalizedName === "safari") {
-		return [`tell ${appTarget} to set URL of front document to "${escapedUrl}"`];
-	}
-	if (CHROME_FAMILY_BUNDLE_IDS.has(target.bundleId ?? "") || CHROME_FAMILY_APP_NAMES.has(normalizedName)) {
-		return [`tell ${appTarget} to set URL of active tab of front window to "${escapedUrl}"`];
-	}
-	return undefined;
-}
-
-async function openBrowserLocationFromPendingAddress(keys: string[], target: ResolvedTarget, signal?: AbortSignal): Promise<boolean> {
-	const isEnter = keys.length === 1 && ["enter", "return"].includes(keys[0]?.trim().toLowerCase());
-	const pending = runtimeState.pendingBrowserAddress;
-	if (!pending) return false;
-	if (!isEnter) {
-		runtimeState.pendingBrowserAddress = undefined;
-		return false;
-	}
-	if (pending.pid !== target.pid || pending.windowId !== target.windowId) {
-		runtimeState.pendingBrowserAddress = undefined;
-		return false;
-	}
-	const script = browserOpenLocationAppleScript(target, pending.text);
-	if (!script) return false;
-	runtimeState.pendingBrowserAddress = undefined;
-	await runAppleScript(script, signal);
-	return true;
-}
-
-function findNewWindow(before: HelperWindow[], after: HelperWindow[]): HelperWindow | undefined {
-	const previous = new Set(before.map(windowIdentity));
-	const added = after.filter((window) => !previous.has(windowIdentity(window)));
-	if (added.length > 0) {
-		return choosePreferredWindow(added, "browser");
-	}
-
-	const promoted = after.filter((window) => {
-		const match = before.find((candidate) => windowIdentity(candidate) === windowIdentity(window));
-		if (!match) return false;
-		return (window.isFocused && !match.isFocused) || (window.isMain && !match.isMain);
-	});
-	if (promoted.length > 0) {
-		return choosePreferredWindow(promoted, "browser");
-	}
-
-	return undefined;
-}
-
-async function openIsolatedBrowserWindow(app: HelperApp, signal?: AbortSignal): Promise<HelperWindow | undefined> {
-	const script = buildBrowserNewWindowAppleScript(app);
-	if (!script) {
-		return undefined;
-	}
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			`Strict AX mode cannot create an isolated browser window for '${app.appName}' because that bootstrap is not AX-only. Open a dedicated browser window first, then call screenshot again.`,
-		);
-	}
-
-	const previousFrontmost = await getFrontmost(signal).catch(() => undefined);
-	const before = await listWindows(app.pid, signal);
-	await runAppleScript(script, signal);
-
-	await beginInputSuppression(signal);
-	try {
-		for (let attempt = 0; attempt < BROWSER_WINDOW_OPEN_ATTEMPTS; attempt += 1) {
-			await sleep(BROWSER_WINDOW_OPEN_POLL_MS, signal);
-			const after = await listWindows(app.pid, signal);
-			const created = findNewWindow(before, after);
-			if (created) {
-				return created;
-			}
-			const focused = after.find((window) => window.isFocused) ?? after.find((window) => window.isMain);
-			if (focused && !before.some((window) => windowIdentity(window) === windowIdentity(focused))) {
-				return focused;
-			}
-		}
-
-		return undefined;
-	} finally {
-		if (previousFrontmost) {
-			await restoreUserFocus(previousFrontmost, signal);
-		}
-		await endInputSuppression(signal);
-	}
 }
 
 function choosePreferredWindow(windows: HelperWindow[], appName: string): HelperWindow {
@@ -2468,7 +2259,7 @@ async function ensureCaptureImage(result: CaptureResult, signal?: AbortSignal): 
 		if (!isRecoverableScreenshotError(error)) {
 			const normalized = normalizeError(error);
 			if (isBrowserApp(result.target.appName, result.target.bundleId)) {
-				throw new Error(`${normalized.message} Browser capture failed for ${result.target.appName} window '${result.target.windowTitle}'. Call list_windows and retry screenshot with an explicit existing content window ref, or use navigate_browser for direct URL navigation.`);
+				throw new Error(`${normalized.message} Browser capture failed for ${result.target.appName} window '${result.target.windowTitle}'. Call list_windows and retry screenshot with an explicit existing content window ref.`);
 			}
 			throw normalized;
 		}
@@ -2785,9 +2576,6 @@ async function dispatchTypeText(text: string, target: ResolvedTarget, signal?: A
 		const focusedElementRef = await focusedTextElementRef(target, signal);
 		if (focusedElementRef) {
 			await setAxValue(focusedElementRef, text, signal);
-			if (isBrowserApp(target.appName, target.bundleId)) {
-				runtimeState.pendingBrowserAddress = { text, pid: target.pid, windowId: target.windowId };
-			}
 			return executionTrace("ax_set_value", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 		}
 	}
@@ -3021,11 +2809,6 @@ async function dispatchKeypress(params: KeypressParams, target: ResolvedTarget, 
 	const keys = normalizeKeyList(params.keys);
 	if (keys.length === 0) {
 		throw new Error("keypress.keys must contain at least one key.");
-	}
-
-	const openedPendingBrowserLocation = await openBrowserLocationFromPendingAddress(keys, target, signal);
-	if (openedPendingBrowserLocation) {
-		return executionTrace("browser_open_location", "stealth", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
 	}
 
 	const focusedAddressViaAX = await focusBrowserAddressField(keys, target, signal);
@@ -3654,54 +3437,6 @@ async function performArrangeWindow(params: ArrangeWindowParams, signal?: AbortS
 	});
 }
 
-async function performNavigateBrowser(params: NavigateBrowserParams, signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails>> {
-	runtimeState.currentImageMode = normalizeImageMode(params.image);
-	await selectWindowIfProvided(params.window, signal);
-	const target = await ensureTargetWindowId(await resolveCurrentTarget(signal), signal);
-	assertBrowserUseAllowed(target);
-	if (!isBrowserApp(target.appName, target.bundleId)) {
-		throw new Error(`navigate_browser requires a browser window, but the target is '${target.appName}'.`);
-	}
-	const url = trimOrUndefined(params.url);
-	if (!url) {
-		throw new Error("navigate_browser.url must be a non-empty URL or browser-search string.");
-	}
-	const script = browserOpenLocationAppleScript(target, url);
-	if (!script) {
-		throw new Error(`navigate_browser does not yet support direct URL navigation for '${target.appName}'. Use keypress Command+L, type_text, Enter instead.`);
-	}
-	// In stealth mode we promise to never activate the user's apps. Empirically,
-	// Chrome's 'set URL of active tab of front window' AppleScript pulls Chrome
-	// to the foreground (Safari's 'set URL of front document' may not, but we
-	// can't tell which AppleScript dialect this script will execute against
-	// without parsing it). The safe thing in stealth is to fail fast and let the
-	// model fall back to the AX-only path: focus the address bar via the
-	// keypress Command+L AX shortcut, set_text the URL, keypress Enter.
-	if (isStrictAxMode()) {
-		strictModeBlock(
-			`navigate_browser is not stealth-safe for '${target.appName}': the AppleScript URL set activates the browser process. Use keypress({ keys: ['Command+L'] }) to focus the address bar via AX, then set_text the URL and keypress Enter.`,
-		);
-	}
-	return await withWindowWriteLock(target, async () => {
-		await focusControlledWindow(target, signal);
-		await runAppleScript(script, signal);
-		await sleep(ACTION_SETTLE_MS, signal);
-		const captureResult = await captureCurrentTarget(signal);
-		return await buildToolResult(
-			"navigate_browser",
-			`Navigated ${captureResult.target.windowRef ? `${captureResult.target.windowRef} ` : ""}${captureResult.target.appName} — ${captureResult.target.windowTitle}. Returned the latest semantic window state.`,
-			captureResult,
-			executionTrace("browser_open_location", "default", {
-				axAttempted: false,
-				axSucceeded: false,
-				fallbackUsed: true,
-				nonStealthReason: "browser_open_location_activates_browser_process",
-			}),
-			signal,
-		);
-	});
-}
-
 async function performComputerActions(params: ComputerActionsParams, signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails>> {
 	runtimeState.currentImageMode = normalizeImageMode(params.image);
 	await selectWindowIfProvided(params.window, signal);
@@ -4186,16 +3921,6 @@ export async function executeArrangeWindow(
 	ctx: ExtensionContext,
 ): Promise<AgentToolResult<ComputerUseDetails>> {
 	return await executeTool(ctx, signal, () => performArrangeWindow(params, signal));
-}
-
-export async function executeNavigateBrowser(
-	_toolCallId: string,
-	params: NavigateBrowserParams,
-	signal: AbortSignal | undefined,
-	_onUpdate: AgentToolUpdateCallback<ComputerUseDetails> | undefined,
-	ctx: ExtensionContext,
-): Promise<AgentToolResult<ComputerUseDetails>> {
-	return await executeTool(ctx, signal, () => performNavigateBrowser(params, signal));
 }
 
 export async function executeComputerActions(

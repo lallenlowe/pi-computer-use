@@ -78,9 +78,6 @@ export function renderCallHeader(
 		if (toolName === "type_text" && typeof args.text === "string") {
 			fragments.push(`"${truncate(args.text, 24)}"`);
 		}
-		if (toolName === "navigate_browser" && typeof args.url === "string") {
-			fragments.push(truncate(args.url, 48));
-		}
 		if (toolName === "arrange_window" && typeof args.preset === "string") {
 			fragments.push(args.preset);
 		}
