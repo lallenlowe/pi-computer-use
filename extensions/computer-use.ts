@@ -1,6 +1,7 @@
 import { defineTool, type ExtensionAPI, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { renderCallHeader, renderResultLine } from "../src/render.ts";
 import {
 	ensureComputerUseSetup,
 	executeAppleScript,
@@ -21,6 +22,20 @@ import {
 	executeWait,
 	reconstructStateFromBranch,
 	stopBridge,
+	type AppleScriptParams,
+	type ArrangeWindowParams,
+	type ClickParams,
+	type ComputerActionsParams,
+	type DragParams,
+	type KeypressParams,
+	type ListWindowsParams,
+	type MoveMouseParams,
+	type NavigateBrowserParams,
+	type ScreenshotParams,
+	type ScrollParams,
+	type SetTextParams,
+	type TypeTextParams,
+	type WaitParams,
 } from "../src/bridge.ts";
 import {
 	getLoadedComputerUseConfig,
@@ -28,6 +43,26 @@ import {
 	loadComputerUseConfig,
 	saveUserComputerUseConfig,
 } from "../src/config.ts";
+
+/**
+ * Wrap a defineTool config with our compact `renderCall`/`renderResult`
+ * pair. The renderers read the tool name from `config.name`, plus the
+ * args (in renderCall) or the result + details (in renderResult), so
+ * one shared implementation drives every computer-use tool.
+ *
+ * The returned object is typed `any` so it doesn't disturb defineTool's
+ * generic inference of the `parameters` schema -> execute() args. Each
+ * tool definition still benefits from full type-checking on its execute
+ * body; the wrapper only relaxes the contract at the defineTool boundary.
+ */
+function withCompactRendering<T extends { name: string }>(config: T): T {
+	return {
+		...config,
+		renderCall: (args: any, theme: any) => renderCallHeader(config.name, args, theme),
+		renderResult: (result: any, options: any, theme: any) =>
+			renderResultLine(config.name, result, options, theme),
+	} as unknown as T;
+}
 
 const windowSelectorSchema = Type.Optional(Type.Union([
 	Type.String({ description: "Optional window ref from list_windows, e.g. @w1" }),
@@ -38,7 +73,7 @@ const imageModeSchema = Type.Optional(Type.Union([Type.Literal("auto"), Type.Lit
 	description: "Optional screenshot attachment mode, default auto",
 }));
 
-const listAppsTool = defineTool({
+const listAppsTool = defineTool(withCompactRendering({
 	name: "list_apps",
 	label: "List Apps",
 	description: "List running macOS apps that can be inspected for computer-use windows.",
@@ -49,12 +84,12 @@ const listAppsTool = defineTool({
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: Record<string, never>, signal, onUpdate, ctx) {
 		return await executeListApps(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const listWindowsTool = defineTool({
+const listWindowsTool = defineTool(withCompactRendering({
 	name: "list_windows",
 	label: "List Windows",
 	description: "List controllable windows for running macOS apps, with titles, ids, geometry, and focus state.",
@@ -70,12 +105,12 @@ const listWindowsTool = defineTool({
 		bundleId: Type.Optional(Type.String({ description: "Optional bundle ID filter, e.g. com.apple.Safari" })),
 		pid: Type.Optional(Type.Number({ description: "Optional process ID filter from list_apps" })),
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: ListWindowsParams, signal, onUpdate, ctx) {
 		return await executeListWindows(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const screenshotTool = defineTool({
+const screenshotTool = defineTool(withCompactRendering({
 	name: "screenshot",
 	label: "Screenshot",
 	description: "Capture the current controlled macOS window, returning semantic AX targets and attaching an image only when fallback is needed.",
@@ -94,12 +129,12 @@ const screenshotTool = defineTool({
 		window: windowSelectorSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: ScreenshotParams, signal, onUpdate, ctx) {
 		return await executeScreenshot(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const clickTool = defineTool({
+const clickTool = defineTool(withCompactRendering({
 	name: "click",
 	label: "Click",
 	description: "Click inside the current controlled window by AX target ref or screenshot-relative coordinates.",
@@ -120,12 +155,12 @@ const clickTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: ClickParams, signal, onUpdate, ctx) {
 		return await executeClick(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const doubleClickTool = defineTool({
+const doubleClickTool = defineTool(withCompactRendering({
 	name: "double_click",
 	label: "Double Click",
 	description: "Double-click inside the current controlled window by AX target ref or screenshot-relative coordinates.",
@@ -145,12 +180,12 @@ const doubleClickTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: ClickParams, signal, onUpdate, ctx) {
 		return await executeDoubleClick(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const moveMouseTool = defineTool({
+const moveMouseTool = defineTool(withCompactRendering({
 	name: "move_mouse",
 	label: "Move Mouse",
 	description: "Move the mouse to screenshot-relative coordinates in the current controlled window.",
@@ -167,12 +202,12 @@ const moveMouseTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: MoveMouseParams, signal, onUpdate, ctx) {
 		return await executeMoveMouse(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const dragTool = defineTool({
+const dragTool = defineTool(withCompactRendering({
 	name: "drag",
 	label: "Drag",
 	description: "Drag along a path of screenshot-relative coordinates in the current controlled window.",
@@ -192,12 +227,12 @@ const dragTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: DragParams, signal, onUpdate, ctx) {
 		return await executeDrag(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const scrollTool = defineTool({
+const scrollTool = defineTool(withCompactRendering({
 	name: "scroll",
 	label: "Scroll",
 	description: "Scroll at screenshot-relative coordinates in the current controlled window.",
@@ -217,12 +252,12 @@ const scrollTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: ScrollParams, signal, onUpdate, ctx) {
 		return await executeScroll(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const keypressTool = defineTool({
+const keypressTool = defineTool(withCompactRendering({
 	name: "keypress",
 	label: "Keypress",
 	description: "Press one key, a key sequence, or a modifier chord in the current controlled window.",
@@ -242,12 +277,12 @@ const keypressTool = defineTool({
 			description: "Keys to press. Modifier arrays like ['Command','L'] are treated as one chord.",
 		}),
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: KeypressParams, signal, onUpdate, ctx) {
 		return await executeKeypress(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const typeTextTool = defineTool({
+const typeTextTool = defineTool(withCompactRendering({
 	name: "type_text",
 	label: "Type Text",
 	description: "Insert text into the currently focused control in the current controlled window.",
@@ -264,12 +299,12 @@ const typeTextTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: TypeTextParams, signal, onUpdate, ctx) {
 		return await executeTypeText(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const setTextTool = defineTool({
+const setTextTool = defineTool(withCompactRendering({
 	name: "set_text",
 	label: "Set Text",
 	description: "Replace an AX text control value by ref, or the currently focused text control when no ref is provided.",
@@ -288,12 +323,12 @@ const setTextTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: SetTextParams, signal, onUpdate, ctx) {
 		return await executeSetText(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const waitTool = defineTool({
+const waitTool = defineTool(withCompactRendering({
 	name: "wait",
 	label: "Wait",
 	description: "Pause briefly, then return the latest semantic state of the current controlled window.",
@@ -309,12 +344,12 @@ const waitTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: WaitParams, signal, onUpdate, ctx) {
 		return await executeWait(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const arrangeWindowTool = defineTool({
+const arrangeWindowTool = defineTool(withCompactRendering({
 	name: "arrange_window",
 	label: "Arrange Window",
 	description: "Move or resize a target window for deterministic layout before interacting with it.",
@@ -339,12 +374,12 @@ const arrangeWindowTool = defineTool({
 		height: Type.Optional(Type.Number({ description: "Window height in screen points" })),
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: ArrangeWindowParams, signal, onUpdate, ctx) {
 		return await executeArrangeWindow(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const navigateBrowserTool = defineTool({
+const navigateBrowserTool = defineTool(withCompactRendering({
 	name: "navigate_browser",
 	label: "Navigate Browser",
 	description: "Navigate a target browser window directly to a URL or search string without relying on address-bar keyboard focus.",
@@ -359,10 +394,10 @@ const navigateBrowserTool = defineTool({
 		window: windowSelectorSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: NavigateBrowserParams, signal, onUpdate, ctx) {
 		return await executeNavigateBrowser(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
 const batchedActionSchema = Type.Union([
 	Type.Object({
@@ -446,7 +481,7 @@ const batchedActionSchema = Type.Union([
 	}),
 ]);
 
-const appleScriptTool = defineTool({
+const appleScriptTool = defineTool(withCompactRendering({
 	name: "apple_script",
 	label: "AppleScript",
 	description:
@@ -466,12 +501,12 @@ const appleScriptTool = defineTool({
 		app: Type.Optional(Type.String({ description: "Optional app name for trace/diagnostics, e.g. 'Messages'" })),
 		timeoutMs: Type.Optional(Type.Number({ description: "Per-call timeout in milliseconds (default from config, capped at 60000)" })),
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: AppleScriptParams, signal, onUpdate, ctx) {
 		return await executeAppleScript(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
-const computerActionsTool = defineTool({
+const computerActionsTool = defineTool(withCompactRendering({
 	name: "computer_actions",
 	label: "Computer Actions",
 	description: "Execute a batch of computer-use actions in the current controlled window, then return one latest state update.",
@@ -489,10 +524,10 @@ const computerActionsTool = defineTool({
 		stateId: stateIdSchema,
 		image: imageModeSchema,
 	}),
-	async execute(toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params: ComputerActionsParams, signal, onUpdate, ctx) {
 		return await executeComputerActions(toolCallId, params, signal, onUpdate, ctx);
 	},
-});
+}));
 
 const TIMEOUT_CHOICES: string[] = ["1000", "2000", "5000", "10000", "30000", "60000"];
 
