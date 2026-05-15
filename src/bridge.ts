@@ -458,6 +458,7 @@ interface RuntimeState {
 	overlayEnabled?: boolean;
 	overlayAnimationStyle?: string;
 	overlayAnimationDurationMs?: number;
+	overlayOcclusionAware?: boolean;
 }
 
 type MouseButtonName = "left" | "right" | "middle";
@@ -1175,6 +1176,7 @@ async function startBridgeProcess(): Promise<ChildProcessWithoutNullStreams> {
 			runtimeState.overlayEnabled = undefined;
 			runtimeState.overlayAnimationStyle = undefined;
 			runtimeState.overlayAnimationDurationMs = undefined;
+			runtimeState.overlayOcclusionAware = undefined;
 		}
 		rejectAllPending(new HelperTransportError(`Computer-use helper crashed: ${error.message}`));
 	});
@@ -1185,6 +1187,7 @@ async function startBridgeProcess(): Promise<ChildProcessWithoutNullStreams> {
 			runtimeState.overlayEnabled = undefined;
 			runtimeState.overlayAnimationStyle = undefined;
 			runtimeState.overlayAnimationDurationMs = undefined;
+			runtimeState.overlayOcclusionAware = undefined;
 		}
 		const reason = sig ? `signal ${sig}` : `exit code ${code ?? "unknown"}`;
 		rejectAllPending(new HelperTransportError(`Computer-use helper exited (${reason}).`));
@@ -1287,11 +1290,13 @@ async function syncOverlayState(signal?: AbortSignal): Promise<void> {
 	const desiredEnabled = cfg.enabled;
 	const desiredStyle = cfg.animation_style;
 	const desiredDuration = cfg.animation_duration_ms;
+	const desiredOcclusion = cfg.occlusion_aware;
 
 	const enabledChanged = runtimeState.overlayEnabled !== desiredEnabled;
 	const styleChanged = runtimeState.overlayAnimationStyle !== desiredStyle;
 	const durationChanged = runtimeState.overlayAnimationDurationMs !== desiredDuration;
-	if (!enabledChanged && !styleChanged && !durationChanged) return;
+	const occlusionChanged = runtimeState.overlayOcclusionAware !== desiredOcclusion;
+	if (!enabledChanged && !styleChanged && !durationChanged && !occlusionChanged) return;
 
 	try {
 		if (enabledChanged) {
@@ -1302,19 +1307,21 @@ async function syncOverlayState(signal?: AbortSignal): Promise<void> {
 			}
 			runtimeState.overlayEnabled = desiredEnabled;
 		}
-		if (desiredEnabled && (styleChanged || durationChanged)) {
+		if (desiredEnabled && (styleChanged || durationChanged || occlusionChanged)) {
 			await bridgeCommand(
 				"overlayConfigure",
-				{ style: desiredStyle, durationMs: desiredDuration },
+				{ style: desiredStyle, durationMs: desiredDuration, occlusionAware: desiredOcclusion },
 				{ signal },
 			);
 			runtimeState.overlayAnimationStyle = desiredStyle;
 			runtimeState.overlayAnimationDurationMs = desiredDuration;
+			runtimeState.overlayOcclusionAware = desiredOcclusion;
 		}
 	} catch {
 		runtimeState.overlayEnabled = undefined;
 		runtimeState.overlayAnimationStyle = undefined;
 		runtimeState.overlayAnimationDurationMs = undefined;
+		runtimeState.overlayOcclusionAware = undefined;
 	}
 }
 

@@ -20,6 +20,7 @@ export interface OverlayConfig {
 	size: number;
 	animation_style: "arc" | "linear" | "off";
 	animation_duration_ms: number;
+	occlusion_aware: boolean;
 }
 
 export interface ComputerUseConfigSource {
@@ -46,6 +47,7 @@ const DEFAULT_OVERLAY_CONFIG: OverlayConfig = {
 	size: 28,
 	animation_style: "arc",
 	animation_duration_ms: 180,
+	occlusion_aware: true,
 };
 
 const DEFAULT_CONFIG: ComputerUseConfig = {
@@ -89,6 +91,8 @@ function normalizeOverlay(raw: unknown): Partial<OverlayConfig> | undefined {
 	if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0) {
 		out.animation_duration_ms = Math.trunc(durationMs);
 	}
+	const occlusion = parseBoolean(src.occlusion_aware ?? src.occlusionAware);
+	if (occlusion !== undefined) out.occlusion_aware = occlusion;
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
