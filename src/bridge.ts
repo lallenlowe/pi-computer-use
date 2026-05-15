@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getComputerUseConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
+import { getComputerUseConfig, getOverlayConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
 import { ensurePermissions, type PermissionStatus } from "./permissions.ts";
 import { loadAppInstructions, type AppInstructions } from "./app-instructions.ts";
 import { performAppleScript, type AppleScriptDetails, type AppleScriptParams } from "./apple-script.ts";
@@ -452,6 +452,10 @@ interface RuntimeState {
 	// in conversation history; subsequent screenshots get a short breadcrumb
 	// reminding it the instructions were already provided.
 	shippedAppInstructions: Set<string>;
+	// Last overlay state we successfully synced to the helper. Lets us
+	// skip the bridge round-trip on every tool call when the user's
+	// config hasn't changed.
+	overlayEnabled?: boolean;
 }
 
 type MouseButtonName = "left" | "right" | "middle";
@@ -1166,6 +1170,7 @@ async function startBridgeProcess(): Promise<ChildProcessWithoutNullStreams> {
 	child.on("error", (error) => {
 		if (runtimeState.helper === child) {
 			runtimeState.helper = undefined;
+			runtimeState.overlayEnabled = undefined;
 		}
 		rejectAllPending(new HelperTransportError(`Computer-use helper crashed: ${error.message}`));
 	});
@@ -1173,6 +1178,7 @@ async function startBridgeProcess(): Promise<ChildProcessWithoutNullStreams> {
 	child.on("exit", (code, sig) => {
 		if (runtimeState.helper === child) {
 			runtimeState.helper = undefined;
+			runtimeState.overlayEnabled = undefined;
 		}
 		const reason = sig ? `signal ${sig}` : `exit code ${code ?? "unknown"}`;
 		rejectAllPending(new HelperTransportError(`Computer-use helper exited (${reason}).`));
@@ -1263,6 +1269,29 @@ async function checkPermissions(signal?: AbortSignal): Promise<PermissionStatus>
 	};
 }
 
+/**
+ * Send overlay enable/disable to the helper if the user's config flipped
+ * since the last sync. Cheap no-op when state is already correct. Errors
+ * are swallowed: the overlay is decorative and must never block a tool
+ * call. We log them via the same channels but don't propagate.
+ */
+async function syncOverlayState(signal?: AbortSignal): Promise<void> {
+	const desired = getOverlayConfig().enabled;
+	if (runtimeState.overlayEnabled === desired) return;
+	try {
+		if (desired) {
+			await bridgeCommand("overlayEnable", {}, { signal });
+		} else {
+			await bridgeCommand("overlayDisable", {}, { signal });
+		}
+		runtimeState.overlayEnabled = desired;
+	} catch {
+		// Swallow: a failed overlay sync should never break tool execution.
+		// Reset cached state so we retry next time.
+		runtimeState.overlayEnabled = undefined;
+	}
+}
+
 async function ensureReady(ctx: ExtensionContext, signal?: AbortSignal): Promise<void> {
 	loadComputerUseConfig(ctx.cwd);
 
@@ -1273,6 +1302,7 @@ async function ensureReady(ctx: ExtensionContext, signal?: AbortSignal): Promise
 	throwIfAborted(signal);
 	await ensureHelperInstalled(signal);
 	await ensureBridgeProcess();
+	await syncOverlayState(signal);
 
 	const now = Date.now();
 	const canUseCachedPermissions =
