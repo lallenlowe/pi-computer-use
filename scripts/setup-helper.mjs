@@ -20,7 +20,7 @@ const archTargets = {
 	arm64: "arm64-apple-macosx14.0",
 	x64: "x86_64-apple-macosx14.0",
 };
-const defaultCodeSignIdentifier = "com.injaneity.pi-computer-use.bridge";
+const defaultCodeSignIdentifier = "com.lallenlowe.pi-computer-use.bridge";
 
 function normalizeArch(arch) {
 	if (arch === "arm64" || arch === "x64") return arch;
