@@ -43,7 +43,6 @@ import {
 	executeKeypress,
 	executeListApps,
 	executeListWindows,
-	executeNavigateBrowser,
 	executeScreenshot,
 	executeSetText,
 	executeTypeText,
@@ -332,20 +331,8 @@ async function main(): Promise<number> {
 		executeArrangeWindow("aw", { preset: "right_half" }, undefined, undefined, ctx),
 	);
 
-	// 9. navigate_browser - blocked in stealth (the AppleScript URL-set call
-	//    activates the browser process; not stealth-safe). On a non-browser
-	//    target the call errors before reaching the stealth check; we treat
-	//    that as a SKIP. On a browser target it must hit the stealth block.
-	const isBrowserTarget = /chrome|safari|firefox|brave|edge|arc|helium/i.test(target.app);
-	if (isBrowserTarget) {
-		await runCase("navigate_browser.stealth_blocked", "strict_mode_block", () =>
-			executeNavigateBrowser("nb", { url: "https://example.com" }, undefined, undefined, ctx),
-		);
-	} else {
-		await runCase("navigate_browser.non_browser", "ax_success", () =>
-			executeNavigateBrowser("nb", { url: "https://example.com" }, undefined, undefined, ctx),
-		);
-	}
+	// (case 9 used to test navigate_browser; tool removed in slice A - the
+	// agent uses the keypress Command+L + set_text + Enter composite instead.)
 
 	// 10. apple_script with a benign read-only Apple Event. Apple Events are
 	//     delivered per-process and do not raise the target app, so frontmost
