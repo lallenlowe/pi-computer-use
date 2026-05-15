@@ -26,6 +26,7 @@
 	},
 	"files": [
 		"extensions",
+		"instructions",
 		"skills",
 		"src",
 		"scripts/build-native.mjs",
