@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" width="600" height="600">
+	<defs>
+		<linearGradient id="g" x1="80" y1="180" x2="500" y2="290" gradientUnits="userSpaceOnUse">
+			<stop offset="0%" stop-color="#3FB5FB"/>
+			<stop offset="55%" stop-color="#9C6FF4"/>
+			<stop offset="100%" stop-color="#E92EE8"/>
+		</linearGradient>
+	</defs>
+	<!--
+		Paper-airplane cursor with the proper concave notch. Vertex
+		tour, starting at the click hotspot:
+		  P0 (122.5, 101.0)  top-left tip - cursor anchor
+		  P1 (440.6, 255.9)  far-right wingtip (rounded)
+		  P2 (288.9, 331.4)  inner notch on the bottom edge (concave V)
+		  P3 (224.8, 525.4)  bottom tail (rounded)
+		  back to P0         along the trailing fuselage edge
+		Each rounded corner uses a quadratic Bezier with the control
+		point pulled outward beyond the corner so the round "bulges"
+		into the corner.
+	-->
+	<path
+		fill="url(#g)"
+		d="
+		   M 122.5 101.0
+		   L 440.6 255.9
+		   Q 490 280 436.7 293.6
+		   L 288.9 331.4
+		   Q 255 340 249.4 374.5
+		   L 224.8 525.4
+		   Q 220 555 212.5 526.0
+		   L 106.3 114.2
+		   Q 100 90 122.5 101.0
+		   Z
+		"
+	/>
+</svg>

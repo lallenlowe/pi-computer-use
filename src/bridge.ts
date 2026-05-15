@@ -456,6 +456,8 @@ interface RuntimeState {
 	// skip the bridge round-trip on every tool call when the user's
 	// config hasn't changed.
 	overlayEnabled?: boolean;
+	overlayAnimationStyle?: string;
+	overlayAnimationDurationMs?: number;
 }
 
 type MouseButtonName = "left" | "right" | "middle";
@@ -1171,6 +1173,8 @@ async function startBridgeProcess(): Promise<ChildProcessWithoutNullStreams> {
 		if (runtimeState.helper === child) {
 			runtimeState.helper = undefined;
 			runtimeState.overlayEnabled = undefined;
+			runtimeState.overlayAnimationStyle = undefined;
+			runtimeState.overlayAnimationDurationMs = undefined;
 		}
 		rejectAllPending(new HelperTransportError(`Computer-use helper crashed: ${error.message}`));
 	});
@@ -1179,6 +1183,8 @@ async function startBridgeProcess(): Promise<ChildProcessWithoutNullStreams> {
 		if (runtimeState.helper === child) {
 			runtimeState.helper = undefined;
 			runtimeState.overlayEnabled = undefined;
+			runtimeState.overlayAnimationStyle = undefined;
+			runtimeState.overlayAnimationDurationMs = undefined;
 		}
 		const reason = sig ? `signal ${sig}` : `exit code ${code ?? "unknown"}`;
 		rejectAllPending(new HelperTransportError(`Computer-use helper exited (${reason}).`));
@@ -1270,25 +1276,45 @@ async function checkPermissions(signal?: AbortSignal): Promise<PermissionStatus>
 }
 
 /**
- * Send overlay enable/disable to the helper if the user's config flipped
- * since the last sync. Cheap no-op when state is already correct. Errors
- * are swallowed: the overlay is decorative and must never block a tool
- * call. We log them via the same channels but don't propagate.
+ * Send overlay enable/disable + animation config to the helper when the
+ * user's config has flipped since the last sync. Cheap no-op when state
+ * is already correct. Errors are swallowed: the overlay is decorative
+ * and must never block a tool call. We reset cached state on error so
+ * the next call retries.
  */
 async function syncOverlayState(signal?: AbortSignal): Promise<void> {
-	const desired = getOverlayConfig().enabled;
-	if (runtimeState.overlayEnabled === desired) return;
+	const cfg = getOverlayConfig();
+	const desiredEnabled = cfg.enabled;
+	const desiredStyle = cfg.animation_style;
+	const desiredDuration = cfg.animation_duration_ms;
+
+	const enabledChanged = runtimeState.overlayEnabled !== desiredEnabled;
+	const styleChanged = runtimeState.overlayAnimationStyle !== desiredStyle;
+	const durationChanged = runtimeState.overlayAnimationDurationMs !== desiredDuration;
+	if (!enabledChanged && !styleChanged && !durationChanged) return;
+
 	try {
-		if (desired) {
-			await bridgeCommand("overlayEnable", {}, { signal });
-		} else {
-			await bridgeCommand("overlayDisable", {}, { signal });
+		if (enabledChanged) {
+			if (desiredEnabled) {
+				await bridgeCommand("overlayEnable", {}, { signal });
+			} else {
+				await bridgeCommand("overlayDisable", {}, { signal });
+			}
+			runtimeState.overlayEnabled = desiredEnabled;
 		}
-		runtimeState.overlayEnabled = desired;
+		if (desiredEnabled && (styleChanged || durationChanged)) {
+			await bridgeCommand(
+				"overlayConfigure",
+				{ style: desiredStyle, durationMs: desiredDuration },
+				{ signal },
+			);
+			runtimeState.overlayAnimationStyle = desiredStyle;
+			runtimeState.overlayAnimationDurationMs = desiredDuration;
+		}
 	} catch {
-		// Swallow: a failed overlay sync should never break tool execution.
-		// Reset cached state so we retry next time.
 		runtimeState.overlayEnabled = undefined;
+		runtimeState.overlayAnimationStyle = undefined;
+		runtimeState.overlayAnimationDurationMs = undefined;
 	}
 }
 

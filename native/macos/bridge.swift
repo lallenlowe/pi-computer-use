@@ -174,37 +174,189 @@ final class InputSuppressionGuard {
 /// configured screen-local point. Drawing is intentionally simple:
 /// a translucent filled circle with a darker ring. We can iterate on
 /// the visual after the wiring is proven.
+/// Custom NSView that paints the agent's virtual cursor at the
+/// configured screen-local point. Renders a paper-airplane shape
+/// translated from `assets/cursor.svg` (600x600 viewBox) into native
+/// NSBezierPath calls so we don't have to ship a sidecar asset and
+/// the shape scales crisply at any cursorSize. SVG (122.5, 101) is
+/// the click hotspot anchor.
 final class OverlayCursorView: NSView {
 	var cursorPoint: CGPoint? = nil
 	var cursorSize: CGFloat = 28
+
+	// SVG viewBox dims and the in-viewBox coords of the click hotspot.
+	// Kept as named constants so the path-translation math reads
+	// cleanly and survives future shape edits without arithmetic
+	// drift between the path data and the anchor positioning.
+	private static let svgViewBoxSize: CGFloat = 600.0
+	private static let svgAnchorX: CGFloat = 122.5
+	private static let svgAnchorY: CGFloat = 101.0
 
 	override var isFlipped: Bool { false }
 
 	override func draw(_ dirtyRect: NSRect) {
 		guard let point = cursorPoint else { return }
-		let radius = cursorSize / 2
-		let rect = NSRect(
-			x: point.x - radius,
-			y: point.y - radius,
-			width: cursorSize,
-			height: cursorSize
-		)
-		let circle = NSBezierPath(ovalIn: rect)
-		NSColor(calibratedRed: 1.0, green: 0.5, blue: 0.0, alpha: 0.45).setFill()
-		circle.fill()
-		NSColor(calibratedRed: 1.0, green: 0.3, blue: 0.0, alpha: 0.95).setStroke()
-		circle.lineWidth = 2.5
-		circle.stroke()
+		guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-		// Center dot for sub-pixel anchor.
-		let dotRect = NSRect(
-			x: point.x - 2,
-			y: point.y - 2,
-			width: 4,
-			height: 4
+		// scale = cursorSize / svgViewBoxSize so the rendered icon is
+		// `cursorSize` points wide along its viewBox dimension.
+		let scale = cursorSize / OverlayCursorView.svgViewBoxSize
+		let path = OverlayCursorView.makeCursorPath(scale: scale)
+
+		// Translate so the SVG anchor lands at `point`. The path is
+		// authored y-flipped inside makeCursorPath (SVG top-down ->
+		// AppKit bottom-up), so the SVG y of the anchor maps to the
+		// (svgViewBoxSize - svgAnchorY) offset in view coords.
+		ctx.saveGState()
+		ctx.translateBy(
+			x: point.x - OverlayCursorView.svgAnchorX * scale,
+			y: point.y - (OverlayCursorView.svgViewBoxSize - OverlayCursorView.svgAnchorY) * scale
 		)
-		NSColor.black.withAlphaComponent(0.85).setFill()
-		NSBezierPath(ovalIn: dotRect).fill()
+
+		// Soft drop shadow under the whole shape.
+		ctx.saveGState()
+		ctx.setShadow(
+			offset: CGSize(width: 0, height: -1.0 * scale * 8),
+			blur: scale * 12,
+			color: NSColor.black.withAlphaComponent(0.35).cgColor
+		)
+
+		// Fill with the SVG's 3-stop gradient (sky blue -> purple ->
+		// magenta). Gradient direction in SVG userSpaceOnUse coords is
+		// from (80, 180) to (500, 290). We map those into our scaled +
+		// y-flipped coordinate space inline.
+		let gradient = CGGradient(
+			colorsSpace: CGColorSpaceCreateDeviceRGB(),
+			colors: [
+				NSColor(calibratedRed: 0.247, green: 0.710, blue: 0.984, alpha: 1.0).cgColor,
+				NSColor(calibratedRed: 0.612, green: 0.435, blue: 0.957, alpha: 1.0).cgColor,
+				NSColor(calibratedRed: 0.914, green: 0.180, blue: 0.910, alpha: 1.0).cgColor,
+			] as CFArray,
+			locations: [0.0, 0.55, 1.0]
+		)
+		if let gradient = gradient {
+			ctx.saveGState()
+			ctx.addPath(path.compatibleCGPath)
+			ctx.clip()
+			let startSVG = NSPoint(x: 80, y: 180)
+			let endSVG = NSPoint(x: 500, y: 290)
+			func s(_ p: NSPoint) -> CGPoint {
+				return CGPoint(x: p.x * scale, y: (OverlayCursorView.svgViewBoxSize - p.y) * scale)
+			}
+			ctx.drawLinearGradient(
+				gradient,
+				start: s(startSVG),
+				end: s(endSVG),
+				options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+			)
+			ctx.restoreGState()
+		}
+		ctx.restoreGState()
+
+		ctx.restoreGState()
+	}
+
+	/// Build the cursor outline as an NSBezierPath at the given scale.
+	/// Path commands are the SVG `d` attribute from assets/cursor.svg,
+	/// translated to NSBezierPath calls. SVG y is top-down; we y-flip
+	/// here so the resulting path is in standard AppKit (bottom-up)
+	/// coords ready to translate into the view.
+	private static func makeCursorPath(scale: CGFloat) -> NSBezierPath {
+		func s(_ x: CGFloat, _ y: CGFloat) -> NSPoint {
+			return NSPoint(x: x * scale, y: (svgViewBoxSize - y) * scale)
+		}
+		// Convert an SVG quadratic Bezier (one control point) to
+		// NSBezierPath's cubic form via the standard 2/3 control-point
+		// formula: c1 = S + 2/3*(C - S); c2 = E + 2/3*(C - E).
+		func q(_ path: NSBezierPath, control cx: CGFloat, _ cy: CGFloat, end ex: CGFloat, _ ey: CGFloat) {
+			let S = path.currentPoint
+			let C = s(cx, cy)
+			let E = s(ex, ey)
+			let c1 = NSPoint(x: S.x + (2.0/3.0) * (C.x - S.x), y: S.y + (2.0/3.0) * (C.y - S.y))
+			let c2 = NSPoint(x: E.x + (2.0/3.0) * (C.x - E.x), y: E.y + (2.0/3.0) * (C.y - E.y))
+			path.curve(to: E, controlPoint1: c1, controlPoint2: c2)
+		}
+		let path = NSBezierPath()
+		path.move(to: s(122.5, 101.0))
+		path.line(to: s(440.6, 255.9))
+		q(path, control: 490, 280, end: 436.7, 293.6)
+		path.line(to: s(288.9, 331.4))
+		q(path, control: 255, 340, end: 249.4, 374.5)
+		path.line(to: s(224.8, 525.4))
+		q(path, control: 220, 555, end: 212.5, 526.0)
+		path.line(to: s(106.3, 114.2))
+		q(path, control: 100, 90, end: 122.5, 101.0)
+		path.close()
+		return path
+	}
+}
+
+extension NSBezierPath {
+	/// Bridge to CGPath so we can use the path with Core Graphics calls
+	/// (clipping, gradients). Named `compatibleCGPath` to avoid
+	/// shadowing the Apple-provided `cgPath` available on macOS 14+;
+	/// using our explicit conversion lets the same code path work even
+	/// if SDK behavior shifts.
+	var compatibleCGPath: CGPath {
+		let cgPath = CGMutablePath()
+		var points = [NSPoint](repeating: .zero, count: 3)
+		for i in 0..<elementCount {
+			let type = element(at: i, associatedPoints: &points)
+			switch type {
+			case .moveTo:
+				cgPath.move(to: points[0])
+			case .lineTo:
+				cgPath.addLine(to: points[0])
+			case .curveTo:
+				cgPath.addCurve(to: points[2], control1: points[0], control2: points[1])
+			case .closePath:
+				cgPath.closeSubpath()
+			@unknown default:
+				break
+			}
+		}
+		return cgPath
+	}
+}
+
+/// Animation style for cursor moves. `arc` uses a quadratic Bézier
+/// with a control point offset perpendicular to the travel vector for
+/// natural, hand-like motion. `linear` is the same eased timing on a
+/// straight line (still smoother than a snap). `off` snaps instantly.
+enum OverlayAnimationStyle: String {
+	case arc
+	case linear
+	case off
+
+	init(_ raw: String?) {
+		switch raw?.lowercased() {
+		case "linear": self = .linear
+		case "off", "none", "snap": self = .off
+		default: self = .arc
+		}
+	}
+}
+
+/// In-flight cursor animation. Held by the OverlayController; mutated
+/// only from main. We sample the current animated position every tick
+/// so a `moveTo` arriving mid-flight can start its new tween from the
+/// cursor's *visual* current position, which gives smooth direction
+/// changes without explicit velocity matching.
+struct CursorAnimation {
+	let start: CGPoint
+	let end: CGPoint
+	let control: CGPoint
+	let startTime: CFTimeInterval
+	let duration: CFTimeInterval
+
+	func point(at now: CFTimeInterval) -> CGPoint {
+		let rawT = duration > 0 ? min(1.0, max(0.0, (now - startTime) / duration)) : 1.0
+		let t = OverlayController.easeOutCubic(rawT)
+		return OverlayController.quadraticBezier(start: start, control: control, end: end, t: CGFloat(t))
+	}
+
+	func isFinished(at now: CFTimeInterval) -> Bool {
+		return now - startTime >= duration
 	}
 }
 
@@ -225,7 +377,15 @@ final class OverlayController {
 	private var windows: [NSWindow] = []
 	private var views: [OverlayCursorView] = []
 	private var lastGlobalPoint: CGPoint? = nil
+	private var currentDisplayedGlobalPoint: CGPoint? = nil
+	private var animation: CursorAnimation? = nil
+	private var displayTimer: Timer? = nil
 	private var screenChangeObserver: NSObjectProtocol? = nil
+
+	// Animation tunables. Settable from the bridge so the TS-side
+	// config can drive them; defaults match a quick, restrained motion.
+	var animationStyle: OverlayAnimationStyle = .arc
+	var animationDuration: CFTimeInterval = 0.180
 
 	private init() {}
 
@@ -251,6 +411,8 @@ final class OverlayController {
 	func disable() {
 		if !enabled { return }
 		enabled = false
+		cancelAnimation()
+		currentDisplayedGlobalPoint = nil
 		if let observer = screenChangeObserver {
 			NotificationCenter.default.removeObserver(observer)
 			screenChangeObserver = nil
@@ -270,10 +432,103 @@ final class OverlayController {
 
 	/// Move the cursor to a global screen coordinate expressed in
 	/// CGEvent / Quartz convention (origin top-left of primary screen).
-	/// Internally converts to AppKit coordinates per screen.
+	/// Internally tweens (or snaps when animation is off) to the new
+	/// point. Returns immediately; the visual catches up over the
+	/// animation duration so the actual click never blocks on motion.
 	func moveTo(globalPoint: CGPoint) {
 		lastGlobalPoint = globalPoint
 		if !enabled { return }
+
+		// If we have no prior position or animation is off, just snap.
+		guard animationStyle != .off, let from = currentDisplayedGlobalPoint else {
+			cancelAnimation()
+			renderGlobalPoint(globalPoint)
+			currentDisplayedGlobalPoint = globalPoint
+			return
+		}
+
+		// Compute start position: if already animating, sample from the
+		// in-flight animation so direction changes are visually smooth.
+		let now = CACurrentMediaTime()
+		let realStart = animation?.point(at: now) ?? from
+
+		// Trivial-distance fast path: snap to avoid spending a frame on a
+		// 1px tween.
+		let dx = globalPoint.x - realStart.x
+		let dy = globalPoint.y - realStart.y
+		let distance = sqrt(dx * dx + dy * dy)
+		if distance < 2 {
+			cancelAnimation()
+			renderGlobalPoint(globalPoint)
+			currentDisplayedGlobalPoint = globalPoint
+			return
+		}
+
+		let control: CGPoint
+		switch animationStyle {
+		case .linear:
+			control = CGPoint(x: (realStart.x + globalPoint.x) / 2, y: (realStart.y + globalPoint.y) / 2)
+		case .arc, .off:
+			// Arc style. Place the control point at the midpoint plus an
+			// offset perpendicular to the travel vector. Bow height grows
+			// with sqrt(distance) so short hops are nearly straight and
+			// long jumps arc visibly without going off-screen.
+			let midX = (realStart.x + globalPoint.x) / 2
+			let midY = (realStart.y + globalPoint.y) / 2
+			let perpX = -dy / distance
+			let perpY = dx / distance
+			let bow = sqrt(distance) * 6
+			control = CGPoint(x: midX + perpX * bow, y: midY + perpY * bow)
+		}
+
+		animation = CursorAnimation(
+			start: realStart,
+			end: globalPoint,
+			control: control,
+			startTime: now,
+			duration: animationDuration
+		)
+		ensureDisplayTimer()
+	}
+
+	private func ensureDisplayTimer() {
+		if displayTimer != nil { return }
+		// 60Hz tick. Timer on the main run loop is good enough for a
+		// short tween and avoids the platform-specific complexity of
+		// CVDisplayLink. tolerance: 0 keeps frames crisp.
+		let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+			self?.tick()
+		}
+		timer.tolerance = 0
+		RunLoop.main.add(timer, forMode: .common)
+		displayTimer = timer
+	}
+
+	private func cancelAnimation() {
+		animation = nil
+		displayTimer?.invalidate()
+		displayTimer = nil
+	}
+
+	private func tick() {
+		guard let anim = animation else {
+			displayTimer?.invalidate()
+			displayTimer = nil
+			return
+		}
+		let now = CACurrentMediaTime()
+		let point = anim.point(at: now)
+		renderGlobalPoint(point)
+		currentDisplayedGlobalPoint = point
+		if anim.isFinished(at: now) {
+			cancelAnimation()
+		}
+	}
+
+	/// Paint the cursor at a specific global screen point across all
+	/// per-screen overlay windows. No state change — callers update
+	/// `currentDisplayedGlobalPoint` themselves.
+	private func renderGlobalPoint(_ globalPoint: CGPoint) {
 		for (index, window) in windows.enumerated() {
 			let screen = window.screen ?? NSScreen.screens[index]
 			let local = convertGlobalToScreenLocal(globalPoint, screen: screen)
@@ -285,6 +540,18 @@ final class OverlayController {
 			}
 			view.needsDisplay = true
 		}
+	}
+
+	static func easeOutCubic(_ t: Double) -> Double {
+		let inv = 1.0 - t
+		return 1.0 - inv * inv * inv
+	}
+
+	static func quadraticBezier(start: CGPoint, control: CGPoint, end: CGPoint, t: CGFloat) -> CGPoint {
+		let inv = 1.0 - t
+		let x = inv * inv * start.x + 2.0 * inv * t * control.x + t * t * end.x
+		let y = inv * inv * start.y + 2.0 * inv * t * control.y + t * t * end.y
+		return CGPoint(x: x, y: y)
 	}
 
 	private func rebuildWindows() {
@@ -561,6 +828,17 @@ final class Bridge {
 			let y = try doubleArg(request, "y")
 			OverlayController.shared.moveTo(globalPoint: CGPoint(x: x, y: y))
 			return ["moved": OverlayController.shared.isEnabled()]
+		case "overlayConfigure":
+			if let style = optionalStringArg(request, "style") {
+				OverlayController.shared.animationStyle = OverlayAnimationStyle(style)
+			}
+			if let durationMs = (request["durationMs"] as? NSNumber)?.doubleValue, durationMs >= 0 {
+				OverlayController.shared.animationDuration = max(0.0, durationMs / 1000.0)
+			}
+			return [
+				"style": OverlayController.shared.animationStyle.rawValue,
+				"durationMs": Int(OverlayController.shared.animationDuration * 1000),
+			]
 		default:
 			throw BridgeFailure(message: "Unknown command '\(cmd)'", code: "unknown_command")
 		}
