@@ -517,10 +517,25 @@ final class OverlayController {
 	private var displayTimer: Timer? = nil
 	private var screenChangeObserver: NSObjectProtocol? = nil
 
+	// PID of the app the agent is currently driving. Used by the
+	// occlusion check to decide whether to render the cursor on each
+	// tick: if the topmost window under the cursor doesn't belong to
+	// this PID, the cursor and its effects are suppressed so the
+	// agent's UI doesn't visually intrude on whatever the user has
+	// brought to the foreground. Updated on every moveTo / trigger
+	// call that supplies an ownerPid.
+	private var lastTargetPid: pid_t? = nil
+	private let helperPid: pid_t = getpid()
+
 	// Animation tunables. Settable from the bridge so the TS-side
 	// config can drive them; defaults match a quick, restrained motion.
 	var animationStyle: OverlayAnimationStyle = .arc
 	var animationDuration: CFTimeInterval = 0.180
+
+	// When true, the overlay hides itself any time the agent's target
+	// app is not the topmost window under the cursor. Default on; set
+	// to false to restore the always-visible legacy behavior.
+	var occlusionAware: Bool = true
 
 	private init() {}
 
@@ -572,8 +587,13 @@ final class OverlayController {
 	/// Internally tweens (or snaps when animation is off) to the new
 	/// point. Returns immediately; the visual catches up over the
 	/// animation duration so the actual click never blocks on motion.
-	func moveTo(globalPoint: CGPoint) {
+	///
+	/// `ownerPid` is the PID of the app the agent is acting on; passing
+	/// it lets the occlusion check suppress rendering when the user
+	/// brings a different window to the foreground.
+	func moveTo(globalPoint: CGPoint, ownerPid: pid_t? = nil) {
 		lastGlobalPoint = globalPoint
+		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
 
 		// If we have no prior position or animation is off, just snap.
@@ -631,7 +651,8 @@ final class OverlayController {
 	/// Trigger an expanding click-ring effect at the given global
 	/// CG point. Multi-click stamps multiple rings spaced 60ms apart
 	/// so the user sees them ripple. No-op when the overlay is off.
-	func triggerClickRing(globalPoint: CGPoint, button: CursorEffectButton, count: Int = 1) {
+	func triggerClickRing(globalPoint: CGPoint, button: CursorEffectButton, count: Int = 1, ownerPid: pid_t? = nil) {
+		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
 		let now = CACurrentMediaTime()
 		let stamped = max(1, min(5, count))
@@ -650,7 +671,8 @@ final class OverlayController {
 	/// element's bounds are known (preferred), otherwise pass nil and
 	/// the view will draw a small pill near the last cursor position
 	/// so the user still gets some signal.
-	func triggerTypeFlash(globalRect: CGRect?) {
+	func triggerTypeFlash(globalRect: CGRect?, ownerPid: pid_t? = nil) {
+		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
 		let now = CACurrentMediaTime()
 		typeFlashes.append(TypeFlashEffect(
@@ -725,10 +747,23 @@ final class OverlayController {
 	/// into screen-local coords. No state change - callers update
 	/// `currentDisplayedGlobalPoint` themselves.
 	private func renderGlobalPoint(_ globalPoint: CGPoint, now: CFTimeInterval = CACurrentMediaTime()) {
+		// Occlusion check: if the topmost real window under the cursor
+		// doesn't belong to the agent's target PID, suppress everything
+		// (cursor + effects) so the overlay never appears in front of an
+		// app the user has brought to the foreground.
+		let shouldRender = shouldRenderForCurrentTarget(at: globalPoint)
+
 		for (index, window) in windows.enumerated() {
 			let screen = window.screen ?? NSScreen.screens[index]
 			let local = convertGlobalToScreenLocal(globalPoint, screen: screen)
 			let view = views[index]
+			if !shouldRender {
+				view.cursorPoint = nil
+				view.clickRings = []
+				view.typeFlashes = []
+				view.needsDisplay = true
+				continue
+			}
 			if NSPointInRect(NSPoint(x: local.x, y: local.y), screen.frame.offsetBy(dx: -screen.frame.origin.x, dy: -screen.frame.origin.y)) {
 				view.cursorPoint = local
 			} else {
@@ -761,10 +796,23 @@ final class OverlayController {
 	/// Repaint with no cursor (e.g. effects-only state). Lets a
 	/// type-flash fire even when we've never tracked a cursor point.
 	private func renderEmpty(now: CFTimeInterval) {
+		// We pick an arbitrary effect/flash anchor for the occlusion
+		// check, since there's no cursor point to test. Click rings vote
+		// first; otherwise type-flash bounds; otherwise just render.
+		let anchor: CGPoint? = clickRings.first.map { $0.globalPoint }
+			?? typeFlashes.compactMap { $0.globalRect.map { CGPoint(x: $0.midX, y: $0.midY) } }.first
+		let shouldRender = anchor.map { shouldRenderForCurrentTarget(at: $0) } ?? true
+
 		for (index, window) in windows.enumerated() {
 			let screen = window.screen ?? NSScreen.screens[index]
 			let view = views[index]
 			view.cursorPoint = nil
+			if !shouldRender {
+				view.clickRings = []
+				view.typeFlashes = []
+				view.needsDisplay = true
+				continue
+			}
 			view.clickRings = clickRings.map { ring in
 				let local = convertGlobalToScreenLocal(ring.globalPoint, screen: screen)
 				return ScreenLocalClickRing(localPoint: local, button: ring.button, age: now - ring.startTime)
@@ -775,6 +823,43 @@ final class OverlayController {
 			}
 			view.needsDisplay = true
 		}
+	}
+
+	/// Returns true when the overlay should be visible right now: either
+	/// occlusion checking is disabled, no target PID has been recorded
+	/// (legacy/test callers), or the topmost real window under `point`
+	/// belongs to the target PID.
+	///
+	/// We walk CGWindowListCopyWindowInfo top-down, skip system layers
+	/// (`kCGWindowLayer != 0` covers menubar, dock, screen-saver, etc.)
+	/// and our own helper's windows (we don't want the overlay to fool
+	/// itself into thinking it's the foreground app), and return true
+	/// only if the first matching window's owner is the target PID.
+	private func shouldRenderForCurrentTarget(at point: CGPoint) -> Bool {
+		if !occlusionAware { return true }
+		guard let target = lastTargetPid else { return true }
+		let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+		guard let entries = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+			return true
+		}
+		for entry in entries {
+			let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+			if layer != 0 { continue }
+			guard let ownerPid = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else { continue }
+			if ownerPid == helperPid { continue }
+			guard let boundsDict = entry[kCGWindowBounds as String] as? [String: Any],
+				let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary)
+			else { continue }
+			// CGWindowList bounds are in CG global coords (top-left origin)
+			// just like the cursor point we receive. Direct contains() is
+			// correct - no AppKit/CG conversion needed here.
+			if bounds.contains(point) {
+				return ownerPid == target
+			}
+		}
+		// No window covers the point (over the desktop). Treat as visible
+		// since the user clearly isn't focused on something else.
+		return true
 	}
 
 	private func convertGlobalRectToScreenLocal(_ globalCG: CGRect, screen: NSScreen) -> CGRect {
@@ -1071,25 +1156,28 @@ final class Bridge {
 		case "overlayMoveTo":
 			let x = try doubleArg(request, "x")
 			let y = try doubleArg(request, "y")
-			OverlayController.shared.moveTo(globalPoint: CGPoint(x: x, y: y))
+			let pid = optionalIntArg(request, "pid").map { pid_t($0) }
+			OverlayController.shared.moveTo(globalPoint: CGPoint(x: x, y: y), ownerPid: pid)
 			return ["moved": OverlayController.shared.isEnabled()]
 		case "overlayClickEffect":
 			let x = try doubleArg(request, "x")
 			let y = try doubleArg(request, "y")
 			let button = CursorEffectButton(rawValue: optionalStringArg(request, "button")?.lowercased() ?? "left") ?? .left
 			let count = optionalIntArg(request, "count") ?? 1
-			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: x, y: y), button: button, count: count)
+			let pid = optionalIntArg(request, "pid").map { pid_t($0) }
+			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: x, y: y), button: button, count: count, ownerPid: pid)
 			return ["triggered": OverlayController.shared.isEnabled()]
 		case "overlayTypeEffect":
 			let x = try? doubleArg(request, "x")
 			let y = try? doubleArg(request, "y")
 			let w = try? doubleArg(request, "w")
 			let h = try? doubleArg(request, "h")
+			let pid = optionalIntArg(request, "pid").map { pid_t($0) }
 			var rect: CGRect? = nil
 			if let x = x, let y = y, let w = w, let h = h, w > 0, h > 0 {
 				rect = CGRect(x: x, y: y, width: w, height: h)
 			}
-			OverlayController.shared.triggerTypeFlash(globalRect: rect)
+			OverlayController.shared.triggerTypeFlash(globalRect: rect, ownerPid: pid)
 			return ["triggered": OverlayController.shared.isEnabled()]
 		case "overlayConfigure":
 			if let style = optionalStringArg(request, "style") {
@@ -1098,9 +1186,13 @@ final class Bridge {
 			if let durationMs = (request["durationMs"] as? NSNumber)?.doubleValue, durationMs >= 0 {
 				OverlayController.shared.animationDuration = max(0.0, durationMs / 1000.0)
 			}
+			if let occlusion = (request["occlusionAware"] as? NSNumber)?.boolValue {
+				OverlayController.shared.occlusionAware = occlusion
+			}
 			return [
 				"style": OverlayController.shared.animationStyle.rawValue,
 				"durationMs": Int(OverlayController.shared.animationDuration * 1000),
+				"occlusionAware": OverlayController.shared.occlusionAware,
 			]
 		default:
 			throw BridgeFailure(message: "Unknown command '\(cmd)'", code: "unknown_command")
@@ -1539,8 +1631,8 @@ final class Bridge {
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
-		OverlayController.shared.moveTo(globalPoint: point)
-		OverlayController.shared.triggerClickRing(globalPoint: point, button: .left)
+		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
+		OverlayController.shared.triggerClickRing(globalPoint: point, button: .left, ownerPid: targetPid)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["pressed": false, "reason": "hit_test_failed"]
 		}
@@ -1836,9 +1928,9 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["pressed": false, "reason": "element_ref_invalid"]
 		}
-		syncOverlayToElement(element)
+		syncOverlayToElement(element, ownerPid: targetPid)
 		if let frame = frameForElement(element) {
-			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: frame.midX, y: frame.midY), button: .left)
+			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: frame.midX, y: frame.midY), button: .left, ownerPid: targetPid)
 		}
 		let result = performActionOrAncestor(startingAt: element, action: kAXPressAction as CFString, targetPid: targetPid)
 		var output: [String: Any] = ["pressed": result["performed"] as? Bool ?? false]
@@ -1860,9 +1952,9 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["performed": false, "reason": "element_ref_invalid"]
 		}
-		syncOverlayToElement(element)
+		syncOverlayToElement(element, ownerPid: targetPid)
 		if let frame = frameForElement(element) {
-			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: frame.midX, y: frame.midY), button: .left)
+			OverlayController.shared.triggerClickRing(globalPoint: CGPoint(x: frame.midX, y: frame.midY), button: .left, ownerPid: targetPid)
 		}
 		return performActionOrAncestor(startingAt: element, action: action, targetPid: targetPid)
 	}
@@ -1875,7 +1967,7 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["focused": false, "reason": "element_ref_invalid"]
 		}
-		syncOverlayToElement(element)
+		syncOverlayToElement(element, ownerPid: targetPid)
 		return focusElementOrAncestor(startingAt: element, targetPid: targetPid)
 	}
 
@@ -1890,7 +1982,7 @@ final class Bridge {
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
-		OverlayController.shared.moveTo(globalPoint: point)
+		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["focused": false, "reason": "hit_test_failed"]
 		}
@@ -1906,7 +1998,7 @@ final class Bridge {
 		guard let element = refStore.element(for: elementRef) else {
 			return ["scrolled": false, "reason": "element_ref_invalid"]
 		}
-		syncOverlayToElement(element)
+		syncOverlayToElement(element, ownerPid: targetPid)
 		return performScrollActionOrAncestor(startingAt: element, targetPid: targetPid, scrollX: optionalIntArg(request, "scrollX") ?? 0, scrollY: optionalIntArg(request, "scrollY") ?? 0, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
 	}
 
@@ -1920,7 +2012,7 @@ final class Bridge {
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight)
-		OverlayController.shared.moveTo(globalPoint: point)
+		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["scrolled": false, "reason": "hit_test_failed"]
 		}
@@ -1931,10 +2023,10 @@ final class Bridge {
 	/// the element exposes a frame. Used by `*Element` AX commands so
 	/// click({ ref }) animates the cursor to the right place even when
 	/// no raw coordinate was supplied.
-	private func syncOverlayToElement(_ element: AXUIElement) {
+	private func syncOverlayToElement(_ element: AXUIElement, ownerPid: pid_t? = nil) {
 		guard let frame = frameForElement(element) else { return }
 		let center = CGPoint(x: frame.midX, y: frame.midY)
-		OverlayController.shared.moveTo(globalPoint: center)
+		OverlayController.shared.moveTo(globalPoint: center, ownerPid: ownerPid)
 	}
 
 	private func hitTestElement(at point: CGPoint) -> AXUIElement? {
@@ -2438,8 +2530,12 @@ final class Bridge {
 		if status != .success {
 			throw BridgeFailure(message: "Failed to set value (AX error \(status.rawValue))", code: "set_value_failed")
 		}
-		// Visual: outline the field that was just populated.
-		OverlayController.shared.triggerTypeFlash(globalRect: frameForElement(element))
+		// Visual: outline the field that was just populated. Look up the
+		// element's owning PID so the occlusion check can target it; AX
+		// exposes this on every element via kAXPIDAttribute.
+		var elementPid: pid_t = 0
+		_ = AXUIElementGetPid(element, &elementPid)
+		OverlayController.shared.triggerTypeFlash(globalRect: frameForElement(element), ownerPid: elementPid > 0 ? elementPid : nil)
 		return ["set": true]
 	}
 
@@ -2453,7 +2549,7 @@ final class Bridge {
 		// otherwise the controller draws a small pill near the cursor.
 		let focused = focusedElementForPid(targetPid)
 		let focusedRect = focused.flatMap { frameForElement($0) }
-		OverlayController.shared.triggerTypeFlash(globalRect: focusedRect)
+		OverlayController.shared.triggerTypeFlash(globalRect: focusedRect, ownerPid: targetPid)
 		return ["typed": true]
 	}
 
@@ -2843,8 +2939,9 @@ final class Bridge {
 		// Sync the agent overlay cursor. No-op when the overlay is
 		// disabled. Single chokepoint: every mouseClick / mouseDrag /
 		// scrollWheel goes through here first so we don't need to wire
-		// each command site individually.
-		OverlayController.shared.moveTo(globalPoint: point)
+		// each command site individually. Pass `pid` so the occlusion
+		// check knows which app the agent is acting on.
+		OverlayController.shared.moveTo(globalPoint: point, ownerPid: pid)
 	}
 
 	private func mouseButton(_ name: String) -> CGMouseButton {
@@ -2898,7 +2995,8 @@ final class Bridge {
 		OverlayController.shared.triggerClickRing(
 			globalPoint: point,
 			button: CursorEffectButton.from(button),
-			count: max(1, clickCount)
+			count: max(1, clickCount),
+			ownerPid: pid
 		)
 		for index in 1...max(1, clickCount) {
 			guard let down = CGEvent(mouseEventSource: nil, mouseType: mouseDownType(for: button), mouseCursorPosition: point, mouseButton: button),

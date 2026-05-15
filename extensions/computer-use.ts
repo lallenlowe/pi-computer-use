@@ -709,7 +709,7 @@ function formatConfigStatus(): string {
 		`browser_use: ${loaded.config.browser_use ? "enabled" : "disabled"}`,
 		`stealth_mode: ${loaded.config.stealth_mode ? "enabled" : "disabled"}`,
 		`apple_script: ${loaded.config.apple_script.enabled ? "enabled" : "disabled"} (restore_frontmost_on_drift=${loaded.config.apple_script.restore_frontmost_on_drift}, timeout_ms=${loaded.config.apple_script.timeout_ms})`,
-		`overlay: ${loaded.config.overlay.enabled ? "enabled" : "disabled"} (size=${loaded.config.overlay.size}, animation=${loaded.config.overlay.animation_style}@${loaded.config.overlay.animation_duration_ms}ms)`,
+		`overlay: ${loaded.config.overlay.enabled ? "enabled" : "disabled"} (size=${loaded.config.overlay.size}, animation=${loaded.config.overlay.animation_style}@${loaded.config.overlay.animation_duration_ms}ms, occlusion_aware=${loaded.config.overlay.occlusion_aware})`,
 		"",
 		"Sources:",
 	];
