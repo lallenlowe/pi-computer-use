@@ -13,6 +13,7 @@ import {
 	executeKeypress,
 	executeListApps,
 	executeListWindows,
+	executeSurfaceWindow,
 	executeWakeWindow,
 	executeMoveMouse,
 	executeNavigateBrowser,
@@ -30,6 +31,7 @@ import {
 	type DragParams,
 	type KeypressParams,
 	type ListWindowsParams,
+	type SurfaceWindowParams,
 	type WakeWindowParams,
 	type MoveMouseParams,
 	type NavigateBrowserParams,
@@ -115,13 +117,13 @@ const listWindowsTool = defineTool(withCompactRendering({
 const wakeWindowTool = defineTool(withCompactRendering({
 	name: "wake_window",
 	label: "Wake Window",
-	description: "Bring a window from another macOS Space to the active Space without changing the user's frontmost app. Use after list_windows reports off_active_space.",
-	promptSnippet: "Pull a controllable window onto the current Space when list_windows reports it as off_active_space.",
+	description: "Status + recovery probe for an off-Space window. Returns whether the window is on the active Space, un-minimizes it if needed, and lists non-GUI alternatives (apple_script, app instructions) to drive it without disturbing the user. Does NOT switch Spaces or activate the app - use surface_window for that.",
+	promptSnippet: "Diagnose an off-Space window and discover non-GUI paths before disturbing the user. Pair with surface_window only when the user has approved a viewport switch.",
 	promptGuidelines: [
-		"Use this only when list_windows or a screenshot error indicates the target window is on another Space.",
+		"Call this when list_windows reports off_active_space, when 'controlled window is no longer available' suggests an off-Space window, or proactively to discover non-GUI alternatives for an unfamiliar app.",
 		"Pass the @wN windowRef returned by list_windows; falling back to {windowId, pid} also works for non-stored refs.",
-		"After wake_window succeeds, call screenshot({ window: '@wN' }) to inspect and target the window.",
-		"This raises the window onto the current Space but does not steal foreground from the user's current app.",
+		"For minimized windows on the active Space, this un-minimizes them quietly. For off-Space windows, this only reports status and recovery options - it does NOT switch Spaces.",
+		"Read the response carefully: prefer apple_script and app-instruction alternatives over surface_window. surface_window is the last-resort disruptive path that should be gated on explicit user permission.",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({
@@ -131,6 +133,28 @@ const wakeWindowTool = defineTool(withCompactRendering({
 	}),
 	async execute(toolCallId, params: WakeWindowParams, signal, onUpdate, ctx) {
 		return await executeWakeWindow(toolCallId, params, signal, onUpdate, ctx);
+	},
+}));
+
+const surfaceWindowTool = defineTool(withCompactRendering({
+	name: "surface_window",
+	label: "Surface Window",
+	description: "DISRUPTIVE: activate the app and raise the target window. macOS will switch the user's viewport to the window's Space (or move the window to the active Space, depending on Spaces settings). Only call after the user has explicitly approved disturbing their workspace.",
+	promptSnippet: "Last-resort surface call for off-Space windows. Requires explicit user permission ('Need to bring <App> forward to do <task>; OK?') because it switches the user's viewport.",
+	promptGuidelines: [
+		"Do NOT call without first asking the user for permission. surface_window switches the user's viewport - that's a foreground-takeover, not a recovery.",
+		"Before considering surface_window, call wake_window first and exhaust the non-GUI alternatives it reports (apple_script, bundled app instructions, URL schemes).",
+		"Pass the @wN windowRef returned by list_windows; falling back to {windowId, pid} also works for non-stored refs.",
+		"After surface_window succeeds, call screenshot({ window: '@wN' }) to inspect the window now that it is on the active Space.",
+	],
+	executionMode: "sequential",
+	parameters: Type.Object({
+		windowRef: Type.Optional(Type.String({ description: "Window ref like @w1 returned by list_windows or screenshot." })),
+		windowId: Type.Optional(Type.Number({ description: "CGWindowID for the target window. Required when windowRef is omitted; must be paired with pid." })),
+		pid: Type.Optional(Type.Number({ description: "Process ID owning the window. Required when windowRef is omitted." })),
+	}),
+	async execute(toolCallId, params: SurfaceWindowParams, signal, onUpdate, ctx) {
+		return await executeSurfaceWindow(toolCallId, params, signal, onUpdate, ctx);
 	},
 }));
 
@@ -759,6 +783,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 		pi.registerTool(listAppsTool);
 		pi.registerTool(listWindowsTool);
 		pi.registerTool(wakeWindowTool);
+		pi.registerTool(surfaceWindowTool);
 		pi.registerTool(screenshotTool);
 		pi.registerTool(clickTool);
 		pi.registerTool(doubleClickTool);

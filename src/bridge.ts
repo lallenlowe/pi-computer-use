@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getComputerUseConfig, getOverlayConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
+import { getAppleScriptConfig, getComputerUseConfig, getOverlayConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
 import { ensurePermissions, type PermissionStatus } from "./permissions.ts";
 import { loadAppInstructions, type AppInstructions } from "./app-instructions.ts";
 import { performAppleScript, type AppleScriptDetails, type AppleScriptParams } from "./apple-script.ts";
@@ -39,9 +39,50 @@ export interface WakeWindowParams {
 	pid?: number;
 }
 
+export interface WakeWindowAlternatives {
+	appleScript: {
+		enabled: boolean;
+		hint: string;
+	};
+	appInstructions: {
+		found: boolean;
+		source: "user" | "bundled" | null;
+		matchedKey: string | null;
+	};
+	surfaceWindow: {
+		tool: "surface_window";
+		windowRef?: string;
+		hint: string;
+	};
+}
+
 export interface WakeWindowDetails {
 	tool: "wake_window";
 	query: WakeWindowParams;
+	pid: number;
+	window: {
+		windowRef?: string;
+		windowId?: number;
+		windowTitle?: string;
+		appName?: string;
+		bundleId?: string;
+	};
+	isOffActiveSpace: boolean;
+	isMinimized: boolean;
+	unminimized: boolean;
+	action: "unminimized" | "on_space_status" | "off_space_status";
+	alternatives: WakeWindowAlternatives;
+}
+
+export interface SurfaceWindowParams {
+	windowRef?: string;
+	windowId?: number;
+	pid?: number;
+}
+
+export interface SurfaceWindowDetails {
+	tool: "surface_window";
+	query: SurfaceWindowParams;
 	appActivated: boolean;
 	windowRaised: boolean;
 	pid: number;
@@ -515,7 +556,7 @@ const MISSING_TARGET_ERROR = "No current controlled window. Call screenshot firs
 const CURRENT_TARGET_GONE_ERROR =
 	"The current controlled window is no longer available. Call screenshot to choose a new target window.";
 const CURRENT_TARGET_OFF_SPACE_ERROR =
-	"The current controlled window is on another macOS Space. Call wake_window({ windowRef }) to bring it to the active Space, or screenshot to choose a different target.";
+	"The current controlled window is on another macOS Space. macOS does not allow silent cross-Space window control - AX cannot deliver actions to off-Space windows. Call wake_window({ windowRef }) for a recipe of non-GUI alternatives (apple_script, app instructions, URL schemes); only call surface_window({ windowRef }) after asking the user for permission to disturb their workspace.";
 const NON_MACOS_ERROR = "pi-computer-use currently supports macOS 15+ only.";
 
 const COMMAND_TIMEOUT_MS = 15_000;
@@ -3728,11 +3769,34 @@ export async function executeWakeWindow(
 	return await executeTool(ctx, signal, () => performWakeWindow(params, signal));
 }
 
-async function performWakeWindow(params: WakeWindowParams, signal?: AbortSignal): Promise<AgentToolResult<WakeWindowDetails>> {
-	const rawParams = params ?? {};
-	const windowRef = trimOrUndefined(rawParams.windowRef);
-	const windowId = Number.isFinite(rawParams.windowId) ? Math.trunc(rawParams.windowId!) : undefined;
-	const explicitPid = Number.isFinite(rawParams.pid) ? Math.trunc(rawParams.pid!) : undefined;
+export async function executeSurfaceWindow(
+	_toolCallId: string,
+	params: SurfaceWindowParams,
+	signal: AbortSignal | undefined,
+	_onUpdate: AgentToolUpdateCallback<SurfaceWindowDetails> | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<SurfaceWindowDetails>> {
+	return await executeTool(ctx, signal, () => performSurfaceWindow(params, signal));
+}
+
+/**
+ * Resolve a wake/surface params object to a (record, pid, windowId)
+ * tuple plus the bridge payload. Both wake_window and surface_window
+ * share the same input shape and resolution rules - the difference is
+ * what they do with the resolved target.
+ */
+function resolveWindowTargetForWake(
+	params: WakeWindowParams | SurfaceWindowParams,
+	toolName: string,
+): {
+	record: WindowRefRecord | undefined;
+	pid: number;
+	payload: Record<string, unknown>;
+	effectiveWindowId: number | undefined;
+} {
+	const windowRef = trimOrUndefined(params.windowRef);
+	const windowId = Number.isFinite(params.windowId) ? Math.trunc(params.windowId!) : undefined;
+	const explicitPid = Number.isFinite(params.pid) ? Math.trunc(params.pid!) : undefined;
 
 	let record: WindowRefRecord | undefined;
 	if (windowRef) {
@@ -3744,7 +3808,7 @@ async function performWakeWindow(params: WakeWindowParams, signal?: AbortSignal)
 
 	const pid = record?.pid ?? explicitPid;
 	if (!pid) {
-		throw new Error("wake_window requires either windowRef or both windowId and pid.");
+		throw new Error(`${toolName} requires either windowRef or both windowId and pid.`);
 	}
 
 	const payload: Record<string, unknown> = { pid };
@@ -3752,12 +3816,102 @@ async function performWakeWindow(params: WakeWindowParams, signal?: AbortSignal)
 	const effectiveWindowId = record?.windowId ?? windowId;
 	if (effectiveWindowId) payload.windowId = effectiveWindowId;
 
+	return { record, pid, payload, effectiveWindowId };
+}
+
+async function performWakeWindow(params: WakeWindowParams, signal?: AbortSignal): Promise<AgentToolResult<WakeWindowDetails>> {
+	const rawParams = params ?? {};
+	const { record, pid, payload, effectiveWindowId } = resolveWindowTargetForWake(rawParams, "wake_window");
+
 	const result = await bridgeCommand<any>("wakeWindow", payload, { signal });
-	const appActivated = toBoolean(result?.appActivated);
-	const windowRaised = toBoolean(result?.windowRaised);
+	const isOffActiveSpace = toBoolean(result?.isOffActiveSpace);
+	const isMinimized = toBoolean(result?.isMinimized);
+	const unminimized = toBoolean(result?.unminimized);
+	const action = (result?.action ?? "on_space_status") as WakeWindowDetails["action"];
+
+	// Discover non-GUI alternatives the agent can use instead of
+	// surfacing the window. apple_script comes from current config;
+	// app instructions come from the existing loadAppInstructions cache
+	// (covers user overrides at ~/.pi/agent/extensions/pi-computer-use
+	// /instructions/<bundleId>.md and bundled instructions/<bundleId>.md).
+	const appleScriptCfg = getAppleScriptConfig();
+	let instructions: AppInstructions | null = null;
+	try {
+		instructions = await loadAppInstructions({
+			bundleId: record?.bundleId,
+			appName: record?.appName,
+		});
+	} catch {
+		// Loader is best-effort. Never block on instruction lookup.
+	}
+
+	const alternatives: WakeWindowAlternatives = {
+		appleScript: {
+			enabled: appleScriptCfg.enabled,
+			hint: appleScriptCfg.enabled
+				? `Try apple_script({ app: "${record?.appName ?? "<app>"}", script: "..." }) for any task this app exposes via its scripting dictionary. Apple Events do not raise the window or change Spaces.`
+				: "Disabled in current config; ask the user to enable apple_script in the computer-use settings if Apple Events would help.",
+		},
+		appInstructions: {
+			found: !!instructions,
+			source: instructions?.source ?? null,
+			matchedKey: instructions?.matchedKey ?? null,
+		},
+		surfaceWindow: {
+			tool: "surface_window",
+			windowRef: record?.ref,
+			hint: "Last resort. surface_window will activate the app and may switch the user's viewport to the window's Space. Ask the user for permission first ('Need to bring <App> forward to do <task>; OK?') before calling it.",
+		},
+	};
 
 	const details: WakeWindowDetails = {
 		tool: "wake_window",
+		query: rawParams,
+		pid,
+		window: {
+			windowRef: record?.ref,
+			windowId: effectiveWindowId,
+			windowTitle: record?.windowTitle,
+			appName: record?.appName,
+			bundleId: record?.bundleId,
+		},
+		isOffActiveSpace,
+		isMinimized,
+		unminimized,
+		action,
+		alternatives,
+	};
+
+	const label = formatWakeLabel(record, pid);
+	const lines: string[] = [];
+
+	if (action === "unminimized") {
+		lines.push(`Un-minimized ${label}. Window is now on the active Space and ready for screenshot/action tools.`);
+	} else if (isOffActiveSpace) {
+		lines.push(`${label} is on a different macOS Space. We cannot drive it silently from another Space - macOS blocks cross-process Space manipulation without SIP-disabled tooling, and AX cannot deliver actions to off-Space windows.`);
+		lines.push("");
+		lines.push("Try these in order before disturbing the user:");
+		lines.push(`1. apple_script: ${alternatives.appleScript.hint}`);
+		lines.push(`2. app_instructions: ${alternatives.appInstructions.found ? `bundled guidance for ${record?.appName ?? "this app"} is available (source: ${alternatives.appInstructions.source}). Read it via screenshot of an on-Space window of this app, or via the loadAppInstructions cache, and look for URL schemes / shell commands / file-edit paths that avoid the GUI.` : `no bundled instructions found for ${record?.appName ?? "this app"} - check if the app supports a URL scheme, command-line interface, or file-based workflow that bypasses the GUI.`}`);
+		lines.push(`3. ask the user to swipe to the Space where ${record?.appName ?? "this window"} is open.`);
+		lines.push(`4. surface_window: ${alternatives.surfaceWindow.hint}`);
+	} else {
+		lines.push(`${label} is already on the active Space and ready for screenshot/action tools.`);
+	}
+
+	return { content: [{ type: "text", text: lines.join("\n") }], details };
+}
+
+async function performSurfaceWindow(params: SurfaceWindowParams, signal?: AbortSignal): Promise<AgentToolResult<SurfaceWindowDetails>> {
+	const rawParams = params ?? {};
+	const { record, pid, payload, effectiveWindowId } = resolveWindowTargetForWake(rawParams, "surface_window");
+
+	const result = await bridgeCommand<any>("surfaceWindow", payload, { signal });
+	const appActivated = toBoolean(result?.appActivated);
+	const windowRaised = toBoolean(result?.windowRaised);
+
+	const details: SurfaceWindowDetails = {
+		tool: "surface_window",
 		query: rawParams,
 		appActivated,
 		windowRaised,
@@ -3770,18 +3924,20 @@ async function performWakeWindow(params: WakeWindowParams, signal?: AbortSignal)
 		},
 	};
 
+	const label = formatWakeLabel(record, pid);
+	const statusBits = [`app activated: ${appActivated}`, `window raised: ${windowRaised}`];
+	const text = appActivated || windowRaised
+		? `Surfaced ${label} (${statusBits.join(", ")}). The user's viewport may have switched. Call screenshot to inspect the window now that it's on the active Space.`
+		: `Could not surface ${label} (${statusBits.join(", ")}). The window may already be on the active Space, or the app refused the request.`;
+
+	return { content: [{ type: "text", text }], details };
+}
+
+function formatWakeLabel(record: WindowRefRecord | undefined, pid: number): string {
 	const pieces: string[] = [];
 	if (record?.appName) pieces.push(record.appName);
 	if (record?.windowTitle) pieces.push(`'${record.windowTitle}'`);
-	const label = pieces.length ? pieces.join(" ") : `pid ${pid}`;
-	const statusBits: string[] = [];
-	statusBits.push(`app activated: ${appActivated}`);
-	statusBits.push(`window raised: ${windowRaised}`);
-	const text = appActivated || windowRaised
-		? `Woke ${label} (${statusBits.join(", ")}). Call screenshot to inspect the window now that it's on the active Space.`
-		: `Could not wake ${label} (${statusBits.join(", ")}). The window may already be on the active Space, or the app refused the request.`;
-
-	return { content: [{ type: "text", text }], details };
+	return pieces.length ? pieces.join(" ") : `pid ${pid}`;
 }
 
 export async function executeScreenshot(
