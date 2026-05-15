@@ -50,12 +50,18 @@ If a browser reports that JavaScript from Apple Events is disabled, stop and pro
 
 ### Recovery loop: "the controlled window is no longer available"
 
-This error usually does **not** mean the window is gone. The most common cause is that the user switched macOS Spaces, leaving the window on a different Space where it's still fully addressable but invisible.
+This error usually does **not** mean the window is gone. The most common cause is that the user switched macOS Spaces, leaving the window on a different Space.
 
-1. Call `list_windows({ pid })` (or `list_windows({ app })`). If the window appears with `off_active_space` in its flags, the window is just on another Space.
-2. Call `wake_window({ windowRef: "@wN" })` to bring it onto the active Space. This activates the app politely without stealing foreground from the user's current app.
-3. Call `screenshot({ window: "@wN" })` to inspect the now-visible window.
-4. Resume your task.
+**macOS reality:** off-Space windows cannot be driven silently. AX cannot deliver actions to them, and there is no SIP-respecting way for one process to move another process's window between Spaces. Surfacing the window switches the user's viewport — a foreground takeover, not a recovery. So the recovery loop is: discover non-GUI alternatives first, only ask the user for permission to surface as a last resort.
+
+1. Call `list_windows({ pid })` (or `list_windows({ app })`). If the window appears with `off_active_space` in its flags, the window is on another Space.
+2. Call `wake_window({ windowRef: "@wN" })`. This is a **status + recovery probe**, not a window-mover. It un-minimizes minimized-but-on-Space windows (silent), and for off-Space windows returns a structured recipe of non-GUI alternatives.
+3. Read the response carefully. Try the alternatives in this order:
+   1. **`apple_script`** — if enabled in the current mode marker, this is your best path. Apple Events do not raise the window or change Spaces. Most macOS apps expose at least basic operations through their scripting dictionary.
+   2. **app instructions** — if `wake_window` reports `appInstructions.found: true`, the app has a bundled or user-supplied recipe (URL scheme, command-line tool, file-based workflow) that bypasses the GUI. Pull up an on-Space window of the app via `screenshot` to read the full instructions, or check `~/.pi/agent/extensions/pi-computer-use/instructions/<bundleId>.md`.
+   3. **app-specific knowledge** — even without bundled instructions, many apps have URL schemes (`obsidian://`, `vscode://`, `slack://`), CLIs (`code`, `gh`, `osascript`), or file-based workflows (Obsidian markdown files, VS Code settings JSON) that an agent can use directly.
+4. If steps 1–3 cannot complete the task, **ask the user for permission to disturb their workspace**: "To do <task> I need to bring <App> forward, which will switch your viewport to its Space. OK?" Only after explicit approval, call `surface_window({ windowRef: "@wN" })` — the explicit disruptive action.
+5. After `surface_window` succeeds, call `screenshot({ window: "@wN" })` and resume.
 
 If the controlled-window error message itself includes a `wake_window({ windowRef: "@wN" })` suggestion, follow it directly — the resolver already detected the off-Space case for you.
 

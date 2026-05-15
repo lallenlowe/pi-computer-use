@@ -28,10 +28,11 @@ import type {
 	ComputerUseDetails,
 	ListAppsDetails,
 	ListWindowsDetails,
+	SurfaceWindowDetails,
 	WakeWindowDetails,
 } from "../src/bridge.ts";
 
-type AnyDetails = ComputerUseDetails | ListAppsDetails | ListWindowsDetails | WakeWindowDetails | AppleScriptDetails | undefined;
+type AnyDetails = ComputerUseDetails | ListAppsDetails | ListWindowsDetails | WakeWindowDetails | SurfaceWindowDetails | AppleScriptDetails | undefined;
 
 interface ThemeLike {
 	bold: (s: string) => string;
@@ -173,6 +174,10 @@ function appOrTargetTag(toolName: string, details: AnyDetails): string | undefin
 			const d = details as WakeWindowDetails;
 			return d.window?.appName;
 		}
+		case "surface_window": {
+			const d = details as SurfaceWindowDetails;
+			return d.window?.appName;
+		}
 		case "apple_script": {
 			const d = details as AppleScriptDetails;
 			return d.app;
@@ -208,6 +213,14 @@ function toolSummary(
 		}
 		case "wake_window": {
 			const d = details as WakeWindowDetails;
+			const bits: string[] = [];
+			if (d.unminimized) bits.push("unminimized");
+			else if (d.isOffActiveSpace) bits.push("off-Space \u2014 see alternatives");
+			else bits.push("on Space");
+			return bits.join(" \u00b7 ");
+		}
+		case "surface_window": {
+			const d = details as SurfaceWindowDetails;
 			const bits: string[] = [];
 			if (d.appActivated) bits.push("app activated");
 			if (d.windowRaised) bits.push("window raised");

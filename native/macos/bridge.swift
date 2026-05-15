@@ -1095,6 +1095,8 @@ final class Bridge {
 			return try listWindows(pid: Int32(try intArg(request, "pid")))
 		case "wakeWindow":
 			return try wakeWindow(request)
+		case "surfaceWindow":
+			return try surfaceWindow(request)
 		case "getFrontmost":
 			return try getFrontmost()
 		case "getUserContext":
@@ -1609,22 +1611,160 @@ final class Bridge {
 	/// window itself which is what asks the WindowServer to drag the
 	/// window onto the current Space. Per-PID delivery, so the raise
 	/// doesn't ripple through to other apps.
+	/// wakeWindow is a STATUS + RECOVERY tool, not a window-mover.
+	///
+	/// macOS does not let one process silently move another process's
+	/// window between Spaces (SLSMoveWindowsToManagedSpace returns CGS
+	/// permission denied without a SIP-disabled scripting addition
+	/// injected into Dock.app). The only honest cross-Space recovery
+	/// paths are:
+	///
+	/// 1. Un-minimize a minimized window via AX. Quiet, in-contract.
+	/// 2. Drive the app via non-GUI paths (apple_script, URL schemes,
+	///    file edits, native command-line tooling) so the off-Space
+	///    window doesn't need to be surfaced at all.
+	/// 3. Ask the user to swipe to the window's Space themselves.
+	/// 4. Call surfaceWindow as a last resort - that's the explicit,
+	///    user-permission-required disruptive action.
+	///
+	/// wakeWindow returns a structured "here are your alternatives"
+	/// payload. It NEVER calls NSRunningApplication.activate() or
+	/// AXRaiseAction. The agent uses the response to plan its next
+	/// move; the TS layer enriches the payload with bundled-instruction
+	/// detection and apple_script availability.
 	private func wakeWindow(_ request: [String: Any]) throws -> [String: Any] {
 		let windowRef = optionalStringArg(request, "windowRef")
-		let windowIdArg = optionalIntArg(request, "windowId")
+		let windowIdArg = optionalIntArg(request, "windowId").map { UInt32($0) }
 		let pidArg = optionalIntArg(request, "pid").map { Int32($0) }
 
-		var targetPid: Int32? = pidArg
+		let (axWindow, resolvedPid, resolvedWindowId) = try resolveWakeTarget(
+			windowRef: windowRef,
+			windowIdArg: windowIdArg,
+			pidArg: pidArg
+		)
+
+		guard let pid = resolvedPid else {
+			throw BridgeFailure(message: "wakeWindow requires either a windowRef or both windowId and pid", code: "invalid_args")
+		}
+
+		var result: [String: Any] = [
+			"pid": Int(pid),
+			"action": "status",
+			"unminimized": false,
+		]
+		if let resolvedWindowId {
+			result["windowId"] = Int(resolvedWindowId)
+		}
+
+		// Detect on/off Space by AX visibility. If the AX element walk
+		// returned a window we can reach, the window is on the active
+		// Space (or minimized but reachable on it). If we had to fall
+		// back to the synthesized CGWindowList path (no axWindow but a
+		// resolvedWindowId from the request), the window is off-Space.
+		let isOffActiveSpace: Bool = (axWindow == nil)
+		let isMinimized: Bool = axWindow.flatMap { boolAttribute($0, attribute: kAXMinimizedAttribute as CFString) } ?? false
+		result["isOffActiveSpace"] = isOffActiveSpace
+		result["isMinimized"] = isMinimized
+
+		// Quiet recovery path: a minimized window can be un-minimized via
+		// AX without changing Spaces or stealing focus. This is the only
+		// recovery this tool will perform on its own.
+		if let axWindow, isMinimized {
+			let status = AXUIElementSetAttributeValue(axWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+			if status == .success {
+				result["unminimized"] = true
+				result["action"] = "unminimized"
+				return result
+			}
+		}
+
+		if isOffActiveSpace {
+			result["action"] = "off_space_status"
+		} else {
+			result["action"] = "on_space_status"
+		}
+		return result
+	}
+
+	/// surfaceWindow is the EXPLICIT disruptive recovery: it activates
+	/// the app and raises the window. On macOS this also switches the
+	/// user's viewport to the window's Space (or moves the window onto
+	/// the active Space, depending on the user's Spaces settings).
+	///
+	/// The TS layer enforces "agent must ask user permission first";
+	/// this command is just the mechanism. Returns whether activate +
+	/// AXRaise succeeded so the agent can confirm before the next call.
+	private func surfaceWindow(_ request: [String: Any]) throws -> [String: Any] {
+		let windowRef = optionalStringArg(request, "windowRef")
+		let windowIdArg = optionalIntArg(request, "windowId").map { UInt32($0) }
+		let pidArg = optionalIntArg(request, "pid").map { Int32($0) }
+
+		let (axWindow, resolvedPid, resolvedWindowId) = try resolveWakeTarget(
+			windowRef: windowRef,
+			windowIdArg: windowIdArg,
+			pidArg: pidArg
+		)
+
+		guard let pid = resolvedPid else {
+			throw BridgeFailure(message: "surfaceWindow requires either a windowRef or both windowId and pid", code: "invalid_args")
+		}
+
+		var appActivated = false
+		if let runningApp = NSRunningApplication(processIdentifier: pid) {
+			appActivated = runningApp.activate(options: [])
+		}
+
+		var windowRaised = false
+		if let axWindow {
+			let status = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+			windowRaised = (status == .success)
+		}
+
+		var result: [String: Any] = [
+			"pid": Int(pid),
+			"appActivated": appActivated,
+			"windowRaised": windowRaised,
+		]
+		if let resolvedWindowId {
+			result["windowId"] = Int(resolvedWindowId)
+		}
+		return result
+	}
+
+	/// Shared resolver for wakeWindow / surfaceWindow. Returns the
+	/// optional AX element (nil for synthesized off-Space entries), the
+	/// resolved pid, and the resolved CGWindowID.
+	private func resolveWakeTarget(
+		windowRef: String?,
+		windowIdArg: UInt32?,
+		pidArg: Int32?
+	) throws -> (axWindow: AXUIElement?, pid: Int32?, windowId: UInt32?) {
 		var axWindow: AXUIElement? = nil
-		if let windowRef = windowRef, let element = refStore.window(for: windowRef) {
+		var targetPid: Int32? = pidArg
+		var resolvedWindowId: UInt32? = windowIdArg
+
+		if let windowRef, let element = refStore.window(for: windowRef) {
 			axWindow = element
 			var pidOut: pid_t = 0
 			if AXUIElementGetPid(element, &pidOut) == .success, pidOut > 0 {
 				targetPid = pidOut
 			}
-		} else if let windowId = windowIdArg, let pid = targetPid {
-			// No live AX ref. Walk the app's AX windows and find the one
-			// matching the CGWindowList candidate by windowId.
+		}
+
+		if resolvedWindowId == nil, let pid = targetPid, let element = axWindow {
+			// Match the AX element to a CGWindowList candidate to recover
+			// its windowId. Same pattern listWindows uses.
+			let candidates = cgWindowCandidates(pid: pid)
+			let axTitle = stringAttribute(element, attribute: kAXTitleAttribute as CFString) ?? ""
+			let axFrame = frameForWindow(element)
+			if let candidate = bestCandidate(frame: axFrame, title: axTitle, candidates: candidates, usedIds: Set<UInt32>()) {
+				resolvedWindowId = candidate.windowId
+			}
+		}
+
+		if axWindow == nil, let windowId = resolvedWindowId, let pid = targetPid {
+			// Try to recover an AX ref so we can attempt the unminimize
+			// path. Walk the app's AX windows and match by windowId.
 			let appElement = AXUIElementCreateApplication(pid)
 			AXUIElementSetMessagingTimeout(appElement, 1.0)
 			let windows = axElementArray(appElement, attribute: kAXWindowsAttribute as CFString)
@@ -1635,41 +1775,14 @@ final class Bridge {
 				let axFrame = frameForWindow(window)
 				let candidate = bestCandidate(frame: axFrame, title: axTitle, candidates: candidates, usedIds: usedIds)
 				if let candidate { usedIds.insert(candidate.windowId) }
-				if candidate?.windowId == UInt32(windowId) {
+				if candidate?.windowId == windowId {
 					axWindow = window
 					break
 				}
 			}
 		}
 
-		guard let pid = targetPid else {
-			throw BridgeFailure(message: "wakeWindow requires either a windowRef or both windowId and pid", code: "invalid_args")
-		}
-
-		// Polite raise: brings the app's windows back to the active Space
-		// without making it frontmost system-wide if we don't pass
-		// .activateAllWindows / .activateIgnoringOtherApps. The window
-		// becomes visible on the current Space; user's focus is preserved.
-		var appActivated = false
-		if let runningApp = NSRunningApplication(processIdentifier: pid) {
-			appActivated = runningApp.activate(options: [])
-		}
-
-		var windowRaised = false
-		if let axWindow = axWindow {
-			// AXRaiseAction is the AX equivalent of clicking the window's
-			// title bar - it pulls the window to the current Space and
-			// makes it the app's main window without forcing the app to
-			// become frontmost.
-			let status = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-			windowRaised = (status == .success)
-		}
-
-		return [
-			"appActivated": appActivated,
-			"windowRaised": windowRaised,
-			"pid": Int(pid),
-		]
+		return (axWindow, targetPid, resolvedWindowId)
 	}
 
 	private func screenshot(_ request: [String: Any]) throws -> [String: Any] {
