@@ -198,10 +198,24 @@ export interface CurrentTarget {
 
 export interface CurrentCapture {
 	stateId: string;
+	/** Image pixel width (typically window logical width × scaleFactor). */
 	width: number;
+	/** Image pixel height. */
 	height: number;
 	scaleFactor: number;
 	timestamp: number;
+	/**
+	 * Window logical-point dimensions. THIS is the coordinate space
+	 * for click/move_mouse/drag/scroll - x in [0, windowWidth], y in
+	 * [0, windowHeight]. Image pixel dimensions are exposed via
+	 * width/height for the model's vision pass; image pixels are NOT
+	 * the input contract.
+	 */
+	windowWidth: number;
+	windowHeight: number;
+	/** Cached window frame in global screen points; passed to native
+	 * helper so it doesn't need to do a fresh SCK lookup per click. */
+	framePoints: { x: number; y: number; w: number; h: number };
 }
 
 interface ActivationFlags {
@@ -271,11 +285,19 @@ export interface ComputerUseDetails {
 	};
 	capture: {
 		stateId: string;
+		/** Image pixel width (typically `windowWidth × scaleFactor`). */
 		width: number;
+		/** Image pixel height. */
 		height: number;
+		/** image / window scale (typically 2.0 on retina). */
 		scaleFactor: number;
 		timestamp: number;
-		coordinateSpace: "window-relative-screenshot-pixels";
+		/** Window logical-point width - the input space for click/move/drag/scroll. */
+		windowWidth: number;
+		/** Window logical-point height. */
+		windowHeight: number;
+		/** Coordinate-units contract version. v3 = window-relative logical points. */
+		coordinateSpace: "window-relative-logical-points";
 	};
 	axTargets?: AxTarget[];
 	activation: ActivationFlags;
@@ -402,6 +424,8 @@ interface ScreenshotPayload {
 	width: number;
 	height: number;
 	scaleFactor: number;
+	windowWidth?: number;
+	windowHeight?: number;
 }
 
 interface FocusedElementResult {
@@ -882,6 +906,23 @@ function normalizeKeyList(value: unknown): string[] {
 	return Array.isArray(value) ? value.filter((key): key is string => typeof key === "string" && key.trim().length > 0) : [];
 }
 
+/**
+ * Validate window-relative LOGICAL POINT coordinates against the latest
+ * capture's window frame.
+ *
+ * Coordinates contract: x in [0, windowWidth], y in [0, windowHeight] -
+ * the same units as `framePoints.w`/`framePoints.h` returned by
+ * `list_windows`. NOT image pixels. The screenshot image is captured at
+ * the display's backing scale (typically 2x on retina), but coordinates
+ * are always logical points.
+ *
+ * Most common bug: the model reads pixel coordinates off the image
+ * (e.g. "the close button is at (1700, 50) in this 1920x1080 image")
+ * and passes those raw to click() on a 880x440-point window. Image
+ * pixels are ~2x larger than logical points; the click lands far past
+ * the right edge. The error message below names this trap explicitly
+ * so the model can self-correct on the next call.
+ */
 function ensurePointIsInCapture(
 	x: number,
 	y: number,
@@ -891,9 +932,15 @@ function ensurePointIsInCapture(
 	if (!Number.isFinite(x) || !Number.isFinite(y)) {
 		throw new Error(`${errorPrefix} must be finite numbers.`);
 	}
-	if (x < 0 || y < 0 || x >= capture.width || y >= capture.height) {
+	const w = capture.windowWidth;
+	const h = capture.windowHeight;
+	if (x < 0 || y < 0 || x > w || y > h) {
+		const scale = capture.scaleFactor || 1;
+		const hint = scale > 1.05
+			? ` Image pixels (${capture.width}x${capture.height}) are ~${scale.toFixed(1)}x logical points; if you read this coordinate from the image, divide by ${scale.toFixed(1)} (image pixel \u2192 logical point).`
+			: "";
 		throw new Error(
-			`${errorPrefix} (${Math.round(x)},${Math.round(y)}) are outside the latest screenshot bounds (${capture.width}x${capture.height}). Call screenshot again and retry.`,
+			`${errorPrefix} (${Math.round(x)},${Math.round(y)}) are outside the window frame (${Math.round(w)}x${Math.round(h)} logical points). Coordinates are window-relative LOGICAL POINTS, not image pixels.${hint} If the window was resized or moved since the last screenshot, call screenshot again and retry.`,
 		);
 	}
 }
@@ -2002,6 +2049,28 @@ function nativeWindowRequest(target: Pick<CurrentTarget, "pid" | "windowId" | "n
 	return { pid: target.pid, windowId: target.windowId, windowRef: target.nativeWindowRef };
 }
 
+/**
+ * Build the canonical capture-context payload for any input op that
+ * takes coordinates. Includes:
+ *   - captureWidth/captureHeight (image-pixel dimensions, kept for
+ *     request-shape compat with the helper but ignored under the v3
+ *     coordinate contract)
+ *   - windowFramePoints {x,y,w,h} (logical points) so the helper can
+ *     skip the SCK currentWindowBounds round-trip and use the cached
+ *     frame the TS layer already knows about
+ */
+function captureRequest(capture: CurrentCapture): {
+	captureWidth: number;
+	captureHeight: number;
+	windowFramePoints: { x: number; y: number; w: number; h: number };
+} {
+	return {
+		captureWidth: capture.width,
+		captureHeight: capture.height,
+		windowFramePoints: { ...capture.framePoints },
+	};
+}
+
 function setCurrentTarget(target: ResolvedTarget): void {
 	assertBrowserUseAllowed(target);
 	const windowRef = target.windowRef ?? storeWindowRefForTarget(target);
@@ -2290,7 +2359,14 @@ async function helperScreenshot(windowId: number, signal?: AbortSignal): Promise
 		width: Math.max(1, Math.trunc(toFiniteNumber(result?.width, 1))),
 		height: Math.max(1, Math.trunc(toFiniteNumber(result?.height, 1))),
 		scaleFactor: Math.max(1, toFiniteNumber(result?.scaleFactor, 1)),
+		windowWidth: toOptionalNumber(result?.windowWidth),
+		windowHeight: toOptionalNumber(result?.windowHeight),
 	};
+}
+
+function toOptionalNumber(value: unknown): number | undefined {
+	const n = typeof value === "number" ? value : Number(value);
+	return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 function windowsByCaptureRecoveryPriority(
@@ -2363,6 +2439,9 @@ function captureForTarget(target: ResolvedTarget): CurrentCapture {
 		height: Math.max(1, Math.round(target.framePoints.h * target.scaleFactor)),
 		scaleFactor: target.scaleFactor,
 		timestamp: Date.now(),
+		windowWidth: target.framePoints.w,
+		windowHeight: target.framePoints.h,
+		framePoints: { ...target.framePoints },
 	};
 }
 
@@ -2373,6 +2452,18 @@ async function ensureCaptureImage(result: CaptureResult, signal?: AbortSignal): 
 		result.capture.width = result.image.width;
 		result.capture.height = result.image.height;
 		result.capture.scaleFactor = result.image.scaleFactor;
+		// Helper now derives scale by comparing image to known window
+		// bounds. If it returned authoritative window dimensions, prefer
+		// those over the AX-cached framePoints (they can drift if the
+		// user resized between listWindows and screenshot).
+		if (typeof result.image.windowWidth === "number" && result.image.windowWidth > 0) {
+			result.capture.windowWidth = result.image.windowWidth;
+			result.capture.framePoints.w = result.image.windowWidth;
+		}
+		if (typeof result.image.windowHeight === "number" && result.image.windowHeight > 0) {
+			result.capture.windowHeight = result.image.windowHeight;
+			result.capture.framePoints.h = result.image.windowHeight;
+		}
 	} catch (error) {
 		if (!isRecoverableScreenshotError(error)) {
 			const normalized = normalizeError(error);
@@ -2387,6 +2478,14 @@ async function ensureCaptureImage(result: CaptureResult, signal?: AbortSignal): 
 		result.capture.width = recovered.image.width;
 		result.capture.height = recovered.image.height;
 		result.capture.scaleFactor = recovered.image.scaleFactor;
+		if (typeof recovered.image.windowWidth === "number" && recovered.image.windowWidth > 0) {
+			result.capture.windowWidth = recovered.image.windowWidth;
+			result.capture.framePoints.w = recovered.image.windowWidth;
+		}
+		if (typeof recovered.image.windowHeight === "number" && recovered.image.windowHeight > 0) {
+			result.capture.windowHeight = recovered.image.windowHeight;
+			result.capture.framePoints.h = recovered.image.windowHeight;
+		}
 		const axResult = await bridgeCommand(
 			"axListTargets",
 			{ ...nativeWindowRequest(result.target), limit: 12 },
@@ -2460,7 +2559,9 @@ async function buildToolResult(
 			height: result.capture.height,
 			scaleFactor: result.capture.scaleFactor,
 			timestamp: result.capture.timestamp,
-			coordinateSpace: "window-relative-screenshot-pixels",
+			windowWidth: result.capture.windowWidth,
+			windowHeight: result.capture.windowHeight,
+			coordinateSpace: "window-relative-logical-points",
 		},
 		axTargets: result.axTargets,
 		activation: result.activation,
@@ -2509,7 +2610,17 @@ async function buildToolResult(
 	// marker would be noise; screenshot is the natural "start of
 	// inspection" moment, mirroring how we ship app instructions there.
 	const markerText = tool === "screenshot" ? `[${formatModeMarker()}]\n` : "";
-	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${markerText}${summary}${axTargetText}${fallbackText}${appInstructionsText}` }];
+	// Coordinate-units reminder. Bolt this onto every screenshot so the
+	// model can't read it once and forget. Names the trap explicitly:
+	// the image is captured at retina backing scale (typically 2x), but
+	// click/move/drag/scroll coordinates are window-relative LOGICAL
+	// POINTS in [0..windowWidth] x [0..windowHeight]. Without this line
+	// models routinely read pixel coords off the image and silently
+	// miss by ~2x.
+	const coordsLine = tool === "screenshot"
+		? `\n\nCoords: window ${Math.round(result.capture.windowWidth)}x${Math.round(result.capture.windowHeight)} pts | image ${result.capture.width}x${result.capture.height} px | scale ${(result.capture.scaleFactor || 1).toFixed(2)}. Click/move/drag/scroll x,y are LOGICAL POINTS in [0..${Math.round(result.capture.windowWidth)}, 0..${Math.round(result.capture.windowHeight)}]. If you read a coordinate off the image, divide by scale before passing it.`
+		: "";
+	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${markerText}${summary}${coordsLine}${axTargetText}${fallbackText}${appInstructionsText}` }];
 	if (fallbackReason) {
 		content.push({ type: "image", data: result.image!.pngBase64, mimeType: "image/png" });
 	}
@@ -2604,8 +2715,7 @@ async function dispatchClick(
 					...nativeWindowRequest(target),
 					x,
 					y,
-					captureWidth: capture.width,
-					captureHeight: capture.height,
+					...captureRequest(capture),
 				},
 				{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 			);
@@ -2622,8 +2732,7 @@ async function dispatchClick(
 						...nativeWindowRequest(target),
 						x,
 						y,
-						captureWidth: capture.width,
-						captureHeight: capture.height,
+						...captureRequest(capture),
 					},
 					{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 				);
@@ -2651,8 +2760,7 @@ async function dispatchClick(
 				y,
 				button,
 				clickCount,
-				captureWidth: capture.width,
-				captureHeight: capture.height,
+				...captureRequest(capture),
 			},
 			{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 		);
@@ -2986,8 +3094,7 @@ async function tryAxScrollAtPoint(
 			scrollX,
 			scrollY,
 			steps: Math.max(scrollStepCount(scrollX), scrollStepCount(scrollY)),
-			captureWidth: capture.width,
-			captureHeight: capture.height,
+			...captureRequest(capture),
 		},
 		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 	).catch((error) => ({ scrolled: false, reason: normalizeError(error).message }));
@@ -3045,8 +3152,7 @@ async function dispatchScroll(
 			y,
 			scrollX,
 			scrollY,
-			captureWidth: capture.width,
-			captureHeight: capture.height,
+			...captureRequest(capture),
 		},
 		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 	);
@@ -3073,7 +3179,7 @@ async function dispatchMoveMouse(
 	ensurePointIsInCapture(x, y, capture);
 	await bridgeCommand(
 		"mouseMove",
-		{ ...nativeWindowRequest(target), x, y, captureWidth: capture.width, captureHeight: capture.height },
+		{ ...nativeWindowRequest(target), x, y, ...captureRequest(capture) },
 		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 	);
 	return executionTrace("coordinate_event_move", "default", {
@@ -3141,7 +3247,7 @@ async function dispatchDrag(
 	}
 	await bridgeCommand(
 		"mouseDrag",
-		{ ...nativeWindowRequest(target), path, captureWidth: capture.width, captureHeight: capture.height },
+		{ ...nativeWindowRequest(target), path, ...captureRequest(capture) },
 		{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
 	);
 	return executionTrace("coordinate_event_drag", "default", {
@@ -4185,12 +4291,23 @@ export function reconstructStateFromBranch(ctx: ExtensionContext): void {
 			nativeWindowRef: typeof (details.target as any).nativeWindowRef === "string" ? (details.target as any).nativeWindowRef : undefined,
 		};
 
+		const restoredWidth = Math.max(1, Math.trunc(toFiniteNumber(details.capture.width, 1)));
+		const restoredHeight = Math.max(1, Math.trunc(toFiniteNumber(details.capture.height, 1)));
+		const restoredScale = Math.max(1, toFiniteNumber(details.capture.scaleFactor, 1));
+		// Persisted captures from older session shapes may not include the
+		// new windowWidth/windowHeight/framePoints fields; derive sane
+		// defaults so coordinate validation still works on resume.
+		const restoredWindowWidth = Math.max(1, toFiniteNumber((details.capture as any).windowWidth, restoredWidth / restoredScale));
+		const restoredWindowHeight = Math.max(1, toFiniteNumber((details.capture as any).windowHeight, restoredHeight / restoredScale));
 		runtimeState.currentCapture = {
 			stateId: details.capture.stateId,
-			width: Math.max(1, Math.trunc(toFiniteNumber(details.capture.width, 1))),
-			height: Math.max(1, Math.trunc(toFiniteNumber(details.capture.height, 1))),
-			scaleFactor: Math.max(1, toFiniteNumber(details.capture.scaleFactor, 1)),
+			width: restoredWidth,
+			height: restoredHeight,
+			scaleFactor: restoredScale,
 			timestamp: Number.isFinite(details.capture.timestamp) ? details.capture.timestamp : Date.now(),
+			windowWidth: restoredWindowWidth,
+			windowHeight: restoredWindowHeight,
+			framePoints: { x: 0, y: 0, w: restoredWindowWidth, h: restoredWindowHeight },
 		};
 		runtimeState.currentAxTargets = Array.isArray(details.axTargets)
 			? details.axTargets.filter((item): item is AxTarget => Boolean(item && typeof item.ref === "string" && typeof item.elementRef === "string"))

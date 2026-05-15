@@ -214,13 +214,13 @@ const clickTool = defineTool(withCompactRendering({
 	promptSnippet: "Click in the current window using coordinates from the latest screenshot or an AX target ref like @e1.",
 	promptGuidelines: [
 		"When screenshot returns AX targets, prefer click(ref=@eN) and use coordinates only when no suitable AX target is available.",
-		"Coordinates are window-relative screenshot pixels from the latest screenshot.",
+		"Coordinates are window-relative LOGICAL POINTS (the same units as list_windows framePoints, NOT image pixels). On retina the screenshot image is captured at ~2x; divide image-pixel measurements by capture.scale before passing them. Out-of-frame coords are rejected with a clear error.",
 		"This tool returns the latest semantic state and attaches an image only when fallback is needed.",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({
-		x: Type.Optional(Type.Number({ description: "X coordinate in screenshot pixels" })),
-		y: Type.Optional(Type.Number({ description: "Y coordinate in screenshot pixels" })),
+		x: Type.Optional(Type.Number({ description: "X coordinate in window-relative logical points (NOT image pixels)" })),
+		y: Type.Optional(Type.Number({ description: "Y coordinate in window-relative logical points (NOT image pixels)" })),
 		ref: Type.Optional(Type.String({ description: "Optional AX target ref from the latest screenshot, e.g. @e1" })),
 		button: Type.Optional(Type.Union([Type.Literal("left"), Type.Literal("right"), Type.Literal("middle")])),
 		clickCount: Type.Optional(Type.Number({ description: "Number of clicks, default 1" })),
@@ -240,13 +240,13 @@ const doubleClickTool = defineTool(withCompactRendering({
 	promptSnippet: "Double-click using coordinates from the latest screenshot or an AX target ref like @e1.",
 	promptGuidelines: [
 		"Use this for opening files, selecting rows, or controls that explicitly need a double-click.",
-		"Coordinates are window-relative screenshot pixels from the latest screenshot.",
+		"Coordinates are window-relative LOGICAL POINTS (the same units as list_windows framePoints, NOT image pixels). On retina the screenshot image is captured at ~2x; divide image-pixel measurements by capture.scale before passing them. Out-of-frame coords are rejected with a clear error.",
 		"Prefer AX refs when the latest screenshot includes a matching target.",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({
-		x: Type.Optional(Type.Number({ description: "X coordinate in screenshot pixels" })),
-		y: Type.Optional(Type.Number({ description: "Y coordinate in screenshot pixels" })),
+		x: Type.Optional(Type.Number({ description: "X coordinate in window-relative logical points (NOT image pixels)" })),
+		y: Type.Optional(Type.Number({ description: "Y coordinate in window-relative logical points (NOT image pixels)" })),
 		ref: Type.Optional(Type.String({ description: "Optional AX target ref from the latest screenshot, e.g. @e1" })),
 		button: Type.Optional(Type.Union([Type.Literal("left"), Type.Literal("right"), Type.Literal("middle")])),
 		window: windowSelectorSchema,
@@ -265,12 +265,12 @@ const moveMouseTool = defineTool(withCompactRendering({
 	promptSnippet: "Move the mouse in the current window using coordinates from the latest screenshot.",
 	promptGuidelines: [
 		"Use this only when hover state matters; prefer semantic AX refs for normal activation.",
-		"Coordinates are window-relative screenshot pixels from the latest screenshot.",
+		"Coordinates are window-relative LOGICAL POINTS (the same units as list_windows framePoints, NOT image pixels). On retina the screenshot image is captured at ~2x; divide image-pixel measurements by capture.scale before passing them. Out-of-frame coords are rejected with a clear error.",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({
-		x: Type.Number({ description: "X coordinate in screenshot pixels" }),
-		y: Type.Number({ description: "Y coordinate in screenshot pixels" }),
+		x: Type.Number({ description: "X coordinate in window-relative logical points (NOT image pixels)" }),
+		y: Type.Number({ description: "Y coordinate in window-relative logical points (NOT image pixels)" }),
 		window: windowSelectorSchema,
 		stateId: stateIdSchema,
 		image: imageModeSchema,
@@ -287,7 +287,7 @@ const dragTool = defineTool(withCompactRendering({
 	promptSnippet: "Drag in the current window using a path from the latest screenshot.",
 	promptGuidelines: [
 		"Use this for sliders, resizing, selection, and drag-and-drop.",
-		"Path points are window-relative screenshot pixels from the latest screenshot.",
+		"Path points are window-relative LOGICAL POINTS, NOT image pixels (see screenshot envelope for window dims and scale).",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({
@@ -312,12 +312,12 @@ const scrollTool = defineTool(withCompactRendering({
 	promptSnippet: "Scroll in the current window using coordinates from the latest screenshot.",
 	promptGuidelines: [
 		"Use positive scrollY to scroll down and negative scrollY to scroll up.",
-		"Coordinates are window-relative screenshot pixels from the latest screenshot.",
+		"Coordinates are window-relative LOGICAL POINTS (the same units as list_windows framePoints, NOT image pixels). On retina the screenshot image is captured at ~2x; divide image-pixel measurements by capture.scale before passing them. Out-of-frame coords are rejected with a clear error.",
 	],
 	executionMode: "sequential",
 	parameters: Type.Object({
-		x: Type.Optional(Type.Number({ description: "X coordinate in screenshot pixels" })),
-		y: Type.Optional(Type.Number({ description: "Y coordinate in screenshot pixels" })),
+		x: Type.Optional(Type.Number({ description: "X coordinate in window-relative logical points (NOT image pixels)" })),
+		y: Type.Optional(Type.Number({ description: "Y coordinate in window-relative logical points (NOT image pixels)" })),
 		ref: Type.Optional(Type.String({ description: "Optional AX scroll target ref from the latest screenshot, e.g. @e1" })),
 		scrollX: Type.Optional(Type.Number({ description: "Horizontal scroll delta in pixels" })),
 		scrollY: Type.Optional(Type.Number({ description: "Vertical scroll delta in pixels" })),
