@@ -1,40 +1,38 @@
 /**
- * Stealth contract regression test.
+ * Focus contract regression test.
  *
- * What it asserts: when stealth mode is on, no public tool will:
+ * What it asserts: no public input tool will:
  *   1. Change the frontmost app
  *   2. Change which window is frontmost within the user's app
+ *
+ * (surface_window and launch_app({activate:true}) are the only tools
+ * that DO change frontmost; they're gated by requireFocusChangeApproval
+ * and are intentionally excluded from this test.)
  *
  * Strategy:
  *   - Pick a sentinel app the user is "working in" (default: Finder).
  *   - Activate the sentinel and capture (frontmostApp, frontmostWindowTitle).
- *   - Force stealth via PI_COMPUTER_USE_STEALTH=1 (set inside the script).
- *   - Run a battery of tool calls against a different running app.
+ *   - Run a battery of input tool calls against a different running app.
  *   - After each call, re-read the frontmost app + window title and assert
  *     they're unchanged.
  *
- * Each tool call is one of:
- *   - expected to succeed (AX-only path) -> record FAIL if stealth contract broken
- *   - expected to error with strict_mode -> record FAIL if it succeeded silently
+ * Each tool call is expected to succeed (per-PID delivery means raw input
+ * works the same as AX-ref input from the contract's point of view).
  *
- * Exits non-zero if any case violates the contract. Suitable for CI smoke.
+ * Exits non-zero if any case observes frontmost drift. Suitable for CI smoke.
  *
  * Run:
- *   npx tsx benchmarks/stealth-contract.ts
+ *   npx tsx benchmarks/focus-contract.ts
  *
  * Optional flags:
  *   --target Slack    pick a non-sentinel app to drive (default: Slack, falls back to first non-sentinel app with a visible window)
  *   --sentinel Finder pick the sentinel "user is working here" app (default: Finder)
- *   --output stealth.json  write the report to a JSON file
+ *   --output focus.json  write the report to a JSON file
  */
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-
-// Force stealth before importing the bridge so its config snapshot picks it up.
-process.env.PI_COMPUTER_USE_STEALTH = "1";
 
 import {
 	executeAppleScript,
@@ -68,7 +66,6 @@ interface Snapshot {
 
 interface CaseRecord {
 	name: string;
-	expected: "ax_success" | "strict_mode_block";
 	status: "PASS" | "FAIL" | "SKIP";
 	driftedFrontmost?: Snapshot;
 	error?: string;
@@ -155,12 +152,6 @@ function makeCtx(): any {
 	};
 }
 
-function isStrictModeError(error: unknown): boolean {
-	if (!error) return false;
-	const message = error instanceof Error ? error.message : String(error);
-	return /strict|stealth/i.test(message);
-}
-
 async function findRunningTarget(): Promise<{ app: string; pid: number; windowTitle: string } | undefined> {
 	const ctx = makeCtx();
 	const apps = await executeListApps("ls", {} as any, undefined, undefined, ctx);
@@ -196,12 +187,11 @@ async function main(): Promise<number> {
 		return 2;
 	}
 
-	console.log(`Stealth contract test:\n  sentinel app:    ${SENTINEL_APP}\n  driving target:  ${target.app}\n  starting frontmost: ${frontmostBefore.app} - ${frontmostBefore.windowTitle}\n`);
+	console.log(`Focus contract test:\n  sentinel app:    ${SENTINEL_APP}\n  driving target:  ${target.app}\n  starting frontmost: ${frontmostBefore.app} - ${frontmostBefore.windowTitle}\n`);
 
 	type RunOutcome = { record: CaseRecord; result?: any };
 	const runCase = async (
 		name: string,
-		expected: "ax_success" | "strict_mode_block",
 		invoke: () => Promise<any>,
 	): Promise<RunOutcome> => {
 		const before = frontmostSnapshot();
@@ -232,26 +222,15 @@ async function main(): Promise<number> {
 			notes.push(`frontmost drifted to ${after.app} - ${after.windowTitle}`);
 		}
 
-		if (expected === "strict_mode_block") {
-			if (succeeded) {
-				status = "FAIL";
-				notes.push("expected strict_mode block but the call succeeded");
-			} else if (!isStrictModeError(error)) {
-				status = "FAIL";
-				notes.push(`error did not look like strict_mode: ${error instanceof Error ? error.message : String(error)}`);
-			}
-		} else if (expected === "ax_success") {
-			if (!succeeded) {
-				// Non-strict failures are environment issues, not contract failures.
-				// Mark as SKIP so this run can still be a clean pass.
-				status = drifted ? "FAIL" : "SKIP";
-				notes.push(`call failed: ${error instanceof Error ? error.message : String(error)}`);
-			}
+		if (!succeeded) {
+			// Non-drift failures are environment issues, not contract failures.
+			// Mark as SKIP so this run can still be a clean pass.
+			status = drifted ? "FAIL" : "SKIP";
+			notes.push(`call failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 
 		const record: CaseRecord = {
 			name,
-			expected,
 			status,
 			driftedFrontmost: drifted ? after : undefined,
 			error: error instanceof Error ? error.message : error ? String(error) : undefined,
@@ -265,7 +244,7 @@ async function main(): Promise<number> {
 	const ctx = makeCtx();
 
 	// 1. screenshot - must succeed and not change focus
-	const shot = await runCase("screenshot.target", "ax_success", () =>
+	const shot = await runCase("screenshot.target", () =>
 		executeScreenshot("ss", { app: target.app, image: "never" }, undefined, undefined, ctx),
 	);
 
@@ -277,68 +256,62 @@ async function main(): Promise<number> {
 	// initial screenshot above set to `target`. We pass image:'never' on tools
 	// that resnap so we don't get a vision fallback PNG bloating the run.
 
-	// 2. click via AX ref (stealth-supported path) - must succeed without raising
+	// 2. click via AX ref - must succeed without raising
 	if (firstButton) {
-		await runCase("click.ax_ref", "ax_success", () =>
+		await runCase("click.ax_ref", () =>
 			executeClick("c", { ref: firstButton.ref, image: "never" }, undefined, undefined, ctx),
 		);
 	} else {
-		records.push({ name: "click.ax_ref", expected: "ax_success", status: "SKIP", notes: "no AX button ref available on target" });
+		records.push({ name: "click.ax_ref", status: "SKIP", notes: "no AX button ref available on target" });
 		console.log("  [SKIP] click.ax_ref - no AX button ref available on target");
 	}
 
-	// 3. click by coordinate at (10,10) - the bridge will try AX press/focus
-	//    at that point first; only if there's no AX element does it fall back to a
-	//    raw event (which stealth then blocks). Either outcome is contract-safe;
-	//    we just assert frontmost doesn't drift.
-	await runCase("click.coordinate", "ax_success", () =>
+	// 3. click by coordinate at (10,10) - the bridge tries AX press/focus
+	//    at that point first; if there's no AX element it falls back to a
+	//    per-PID coordinate event. Either path is contract-safe; we just
+	//    assert frontmost doesn't drift.
+	await runCase("click.coordinate", () =>
 		executeClick("c", { x: 10, y: 10, image: "never" }, undefined, undefined, ctx),
 	);
 
-	// 4. set_text via AX ref to its own current value - succeeds without raise
+	// 4. set_text via AX ref to its own current value
 	if (firstTextish) {
-		await runCase("set_text.ax_ref", "ax_success", () =>
+		await runCase("set_text.ax_ref", () =>
 			executeSetText("st", { ref: firstTextish.ref, text: firstTextish.value ?? "", image: "never" }, undefined, undefined, ctx),
 		);
 	} else {
-		records.push({ name: "set_text.ax_ref", expected: "ax_success", status: "SKIP", notes: "no settable AX text target" });
+		records.push({ name: "set_text.ax_ref", status: "SKIP", notes: "no settable AX text target" });
 		console.log("  [SKIP] set_text.ax_ref - no settable AX text target");
 	}
 
-	// 5. set_text without ref - succeeds via the AX-focused-element fallback if
-	//    one exists, otherwise blocks. Either is contract-safe; we just assert
-	//    frontmost doesn't drift.
-	await runCase("set_text.no_ref", "ax_success", () =>
+	// 5. set_text without ref - succeeds via the AX-focused-element fallback
+	//    if one exists, otherwise the raw_key_text per-PID path.
+	await runCase("set_text.no_ref", () =>
 		executeSetText("st2", { text: "hello", image: "never" }, undefined, undefined, ctx),
 	);
 
-	// 6. type_text - raw keyboard fallback, must be blocked
-	await runCase("type_text.raw", "strict_mode_block", () =>
+	// 6. type_text - per-PID keyboard delivery; lands without raising the target.
+	await runCase("type_text.per_pid", () =>
 		executeTypeText("tt", { text: "hello", image: "never" }, undefined, undefined, ctx),
 	);
 
-	// 7. keypress with no AX semantic equivalent - delivered via per-PID event
-	//    posting, which doesn't move the system cursor or change frontmost.
-	//    Stealth-safe by mechanism. We just assert frontmost doesn't drift.
-	await runCase("keypress.fallback", "ax_success", () =>
+	// 7. keypress with no AX semantic equivalent - per-PID event posting,
+	//    doesn't move the system cursor or change frontmost.
+	await runCase("keypress.per_pid", () =>
 		executeKeypress("kp", { keys: ["F12"], image: "never" }, undefined, undefined, ctx),
 	);
 
-	// 8. arrange_window on target - this physically moves a window; in stealth
-	//    we don't yet block this (audit decision: it's safe but surprising).
-	//    Asserting only that it doesn't drift the user's frontmost.
-	await runCase("arrange_window.preset", "ax_success", () =>
+	// 8. arrange_window on target - this physically moves a window. Asserting
+	//    only that it doesn't drift the user's frontmost.
+	await runCase("arrange_window.preset", () =>
 		executeArrangeWindow("aw", { preset: "right_half" }, undefined, undefined, ctx),
 	);
 
-	// (case 9 used to test navigate_browser; tool removed in slice A - the
-	// agent uses the keypress Command+L + set_text + Enter composite instead.)
-
-	// 10. apple_script with a benign read-only Apple Event. Apple Events are
-	//     delivered per-process and do not raise the target app, so frontmost
-	//     must stay on the sentinel. We also assert frontmostDrifted is false
-	//     in the result payload.
-	const appleResult = await runCase("apple_script.read_only", "ax_success", () =>
+	// 9. apple_script with a benign read-only Apple Event. Apple Events are
+	//    delivered per-process and do not raise the target app, so frontmost
+	//    must stay on the sentinel. We also assert frontmostDrifted is false
+	//    in the result payload.
+	const appleResult = await runCase("apple_script.read_only", () =>
 		executeAppleScript(
 			"as",
 			{ script: 'tell application "Finder" to get name of startup disk', app: "Finder" },
@@ -361,7 +334,7 @@ async function main(): Promise<number> {
 	const skipped = records.filter((r) => r.status === "SKIP").length;
 
 	const after = frontmostSnapshot();
-	console.log(`\nStealth contract: ${passed} PASS, ${failed} FAIL, ${skipped} SKIP`);
+	console.log(`\nFocus contract: ${passed} PASS, ${failed} FAIL, ${skipped} SKIP`);
 	console.log(`final frontmost: ${after.app} - ${after.windowTitle}${snapshotsMatch(after, frontmostBefore) ? " (unchanged)" : " (DRIFTED)"}`);
 
 	if (OUTPUT_PATH) {

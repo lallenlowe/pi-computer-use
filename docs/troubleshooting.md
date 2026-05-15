@@ -85,17 +85,15 @@ Example:
 }
 ```
 
-## Strict AX Mode Blocks An Action
+## Focus Tools Throw "User declined"
 
-Strict AX mode blocks:
+`surface_window` and `launch_app({ activate: true })` go through `requireFocusChangeApproval`. If the user declines the `ctx.ui.confirm` prompt (or pi has no UI surface to prompt with), the call throws.
 
-- raw pointer events
-- raw keyboard events
-- foreground focus fallbacks
-- cursor takeover
-- non-AX browser bootstrap
+When this happens:
 
-Use AX refs from the latest `screenshot`, open a dedicated browser window manually, or disable strict AX mode for workflows that require raw event fallback.
+- Re-evaluate whether you really need focus. Off-Space windows can often be driven by `apple_script` (Apple Events do not raise the window) or by app-specific URL schemes / CLIs surfaced through `wake_window`.
+- If you do need focus, ask the user out-of-band with a clearer reason and retry.
+- For autonomous runs where the prompt is the problem, the user can set `focus_auto_approve: true` in `~/.pi/agent/extensions/pi-computer-use.json`.
 
 ## Coordinates Are Rejected As Stale
 

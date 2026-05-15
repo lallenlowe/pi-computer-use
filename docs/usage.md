@@ -144,26 +144,12 @@ computer_actions({
 
 Do not batch when the next action depends on seeing the intermediate result.
 
-Each batched action includes execution metadata, including whether it used the `stealth` or `default` variant.
+Each batched action includes execution metadata: the strategy used (`ax_press`, `ax_set_value`, `coordinate_event_click`, `per_pid_keypress`, …), whether AX was attempted/succeeded, and whether a fallback fired.
 
-## Strict AX Mode
+## Focus changes
 
-Strict AX mode requires background-safe Accessibility paths.
+The extension's contract is fixed:
 
-Allowed when AX support is available:
-
-- AX press/focus
-- AX value replacement
-- AX scroll
-- AX increment/decrement adjustment
-- Semantic key actions such as confirm/cancel/press
-
-Blocked:
-
-- Raw pointer events
-- Raw keyboard events
-- Foreground focus fallbacks
-- Cursor takeover
-- Browser window bootstrap that requires non-AX automation
-
-Enable strict AX mode with config or environment variables. See [configuration](./configuration.md).
+- All input ops (clicks, keypresses, type_text, scroll, drag, set_text) are delivered per-PID. They never raise the target window or change the user's frontmost.
+- Two tools do change frontmost: `surface_window` and `launch_app({ activate: true })`. Both call `ctx.ui.confirm` first, surfacing the `reason` you pass so the user knows why focus is about to move. If the user declines (or there's no UI surface available), the call throws with a structured error pointing the agent at non-focus alternatives (`wake_window` recipes, `apple_script`, bundled instructions).
+- For autonomous runs you can set `focus_auto_approve: true` to skip the prompt. See [configuration](./configuration.md).
