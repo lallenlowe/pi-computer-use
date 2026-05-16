@@ -595,6 +595,23 @@ const BROWSER_BUNDLE_IDS = new Set([
 	"net.imput.helium",
 	"org.mozilla.firefox",
 ]);
+// Apps whose primary content is a framebuffer / opaque render surface
+// macOS AX can't see into. Coordinate clicks on these windows still
+// route correctly via the per-PID + frontmost-HID-tap path, but the
+// hit-test attempts (axPressAtPoint / axFocusAtPoint) waste two
+// helper round-trips before falling through, and flip the result's
+// fallbackUsed flag to true - whichn triggers the 'image attached
+// for recovery' branch on every click, ballooning history. Listing the
+// app here short-circuits the AX hit-test for clicks into its windows.
+//
+// We're deliberately conservative: only apps whose windows are KNOWN
+// opaque go here. Other apps with sparse AX still benefit from the
+// hit-test attempts because some controls do surface.
+const OPAQUE_FRAMEBUFFER_BUNDLE_IDS = new Set([
+	"com.utmapp.UTM",
+	// add: parallels, vmware fusion, etc. as they're verified.
+]);
+
 const BROWSER_APP_NAMES = new Set([
 	"safari",
 	"google chrome",
@@ -1598,6 +1615,15 @@ function isBrowserApp(appName: string, bundleId?: string): boolean {
 	return BROWSER_BUNDLE_IDS.has(bundleId ?? "") || BROWSER_APP_NAMES.has(normalizeText(appName));
 }
 
+/// True when the target app's primary content is a framebuffer macOS
+/// AX can't see into. Used by dispatchClick to skip the AX hit-test
+/// round-trips that would always fail for these apps, and to keep
+/// fallbackUsed=false so the result doesn't trigger the per-click
+/// 'image attached for recovery' image attachment.
+function isOpaqueFramebufferApp(bundleId?: string): boolean {
+	return OPAQUE_FRAMEBUFFER_BUNDLE_IDS.has(bundleId ?? "");
+}
+
 function assertBrowserUseAllowed(target: { appName: string; bundleId?: string }): void {
 	if (!isBrowserUseEnabled() && isBrowserApp(target.appName, target.bundleId)) {
 		throw new Error(
@@ -2473,7 +2499,14 @@ async function dispatchClick(
 
 	let clickedViaAX = false;
 	let focusedViaAX = false;
-	const canTryAX = button === "left" && clickCount === 1;
+	// Skip AX hit-test for apps whose windows are opaque framebuffers
+	// (UTM VM display, etc). The hit-test always fails for these, and
+	// the failure flips fallbackUsed=true which then ships a fresh
+	// screenshot image on every coordinate click - expensive and the
+	// 'fallback path' noise misleads the agent into adjusting its
+	// strategy when nothing is actually wrong.
+	const skipAxHitTest = isOpaqueFramebufferApp(target.bundleId);
+	const canTryAX = button === "left" && clickCount === 1 && !skipAxHitTest;
 	if (canTryAX) {
 		try {
 			const axResult = await bridgeCommand<AxPressAtPointResult>(
