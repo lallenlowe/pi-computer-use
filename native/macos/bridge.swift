@@ -112,6 +112,22 @@ struct TypeFlashEffect {
 	}
 }
 
+/// One "agent pressed a key" badge effect. Anchored to either a
+/// global point (focused element's frame midpoint or fallback cursor)
+/// and rendered as a small rounded pill containing the key label.
+/// Slightly longer-lived than a click ring so chord text is readable.
+struct KeypressBadgeEffect {
+	let id: UUID
+	let globalPoint: CGPoint
+	let label: String
+	let startTime: CFTimeInterval
+	static let duration: CFTimeInterval = 0.700
+
+	func isFinished(at now: CFTimeInterval) -> Bool {
+		return now - startTime >= KeypressBadgeEffect.duration
+	}
+}
+
 /// Pre-converted, per-screen-local effect descriptors that the view
 /// renders on each draw. The OverlayController owns effects in global
 /// CG coords and walks them per-screen at render time, mirroring how
@@ -124,6 +140,12 @@ struct ScreenLocalClickRing {
 
 struct ScreenLocalTypeFlash {
 	let localRect: CGRect
+	let age: CFTimeInterval
+}
+
+struct ScreenLocalKeypressBadge {
+	let localPoint: CGPoint
+	let label: String
 	let age: CFTimeInterval
 }
 
@@ -142,6 +164,7 @@ final class OverlayCursorView: NSView {
 	var cursorSize: CGFloat = 28
 	var clickRings: [ScreenLocalClickRing] = []
 	var typeFlashes: [ScreenLocalTypeFlash] = []
+	var keypressBadges: [ScreenLocalKeypressBadge] = []
 
 	// SVG viewBox dims and the in-viewBox coords of the click hotspot.
 	// Kept as named constants so the path-translation math reads
@@ -160,6 +183,7 @@ final class OverlayCursorView: NSView {
 		// occluded by the very thing it's announcing.
 		drawTypeFlashes(ctx)
 		drawClickRings(ctx)
+		drawKeypressBadges(ctx)
 
 		guard let point = cursorPoint else { return }
 
@@ -272,6 +296,70 @@ final class OverlayCursorView: NSView {
 			NSColor(calibratedRed: 0.247, green: 0.710, blue: 0.984, alpha: alpha * 0.95).setStroke()
 			path.lineWidth = 2.0
 			path.stroke()
+		}
+	}
+
+	/// Render every currently-active keypress badge as a small rounded
+	/// pill containing the chord label ("↵", "Cmd+L", "Esc"). Same
+	/// fade envelope as type flashes so the visual language is
+	/// consistent. Pill is sky-blue filled with white text - blue is
+	/// the documented "keyboard input" color in the agent action
+	/// language.
+	private func drawKeypressBadges(_ ctx: CGContext) {
+		for badge in keypressBadges {
+			let t = max(0.0, min(1.0, badge.age / KeypressBadgeEffect.duration))
+			// Envelope: 80ms in / 420ms hold / 200ms out. Slightly
+			// hold-heavier than type-flash since chord text takes a
+			// beat to read.
+			let alpha: CGFloat
+			let fadeIn = 0.080 / KeypressBadgeEffect.duration
+			let holdEnd = (0.080 + 0.420) / KeypressBadgeEffect.duration
+			if t < fadeIn {
+				alpha = CGFloat(t / fadeIn)
+			} else if t < holdEnd {
+				alpha = 1.0
+			} else {
+				alpha = CGFloat((1.0 - t) / (1.0 - holdEnd))
+			}
+			if alpha <= 0 { continue }
+
+			// Lay out the text. SF Mono so chord labels read crisp
+			// at the small size we need.
+			let attrs: [NSAttributedString.Key: Any] = [
+				.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold),
+				.foregroundColor: NSColor.white.withAlphaComponent(alpha),
+			]
+			let attributed = NSAttributedString(string: badge.label, attributes: attrs)
+			let textSize = attributed.size()
+
+			// Pill geometry: padding around the text, rounded ends.
+			let padX: CGFloat = 8
+			let padY: CGFloat = 4
+			let pillWidth = ceil(textSize.width) + padX * 2
+			let pillHeight = ceil(textSize.height) + padY * 2
+			let radius = pillHeight / 2
+
+			// Anchor: 14pt right and 22pt up from the badge point so the
+			// pill floats just above-right of the cursor / focused
+			// element midpoint without overlapping the cursor sprite.
+			let originX = badge.localPoint.x + 14
+			let originY = badge.localPoint.y + 22
+			let pillRect = NSRect(x: originX, y: originY, width: pillWidth, height: pillHeight)
+			let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: radius, yRadius: radius)
+
+			// Fill: sky-blue (matches the cursor gradient start +
+			// type-flash stroke). White text rides on top.
+			NSColor(calibratedRed: 0.247, green: 0.710, blue: 0.984, alpha: alpha * 0.95).setFill()
+			pillPath.fill()
+
+			// Subtle white outline so the pill stays readable on
+			// matching-color backgrounds.
+			NSColor.white.withAlphaComponent(alpha * 0.35).setStroke()
+			pillPath.lineWidth = 1.0
+			pillPath.stroke()
+
+			let textOrigin = NSPoint(x: originX + padX, y: originY + padY)
+			attributed.draw(at: textOrigin)
 		}
 	}
 
@@ -400,6 +488,7 @@ final class OverlayController {
 	private var animation: CursorAnimation? = nil
 	private var clickRings: [ClickRingEffect] = []
 	private var typeFlashes: [TypeFlashEffect] = []
+	private var keypressBadges: [KeypressBadgeEffect] = []
 	private var displayTimer: Timer? = nil
 	private var screenChangeObserver: NSObjectProtocol? = nil
 
@@ -450,6 +539,7 @@ final class OverlayController {
 		cancelAnimation()
 		clickRings.removeAll()
 		typeFlashes.removeAll()
+		keypressBadges.removeAll()
 		currentDisplayedGlobalPoint = nil
 		if let observer = screenChangeObserver {
 			NotificationCenter.default.removeObserver(observer)
@@ -570,6 +660,27 @@ final class OverlayController {
 		ensureDisplayTimer()
 	}
 
+	/// Trigger a keypress-badge effect. Anchored to `globalPoint` if
+	/// supplied (typically the focused element's frame midpoint),
+	/// otherwise to the last known cursor position. No-op when no
+	/// anchor exists at all - we'd rather drop the visual than render
+	/// at (0,0).
+	func triggerKeypressBadge(label: String, globalPoint: CGPoint? = nil, ownerPid: pid_t? = nil) {
+		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
+		if !enabled { return }
+		let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+		if trimmed.isEmpty { return }
+		guard let anchor = globalPoint ?? lastGlobalPoint else { return }
+		let now = CACurrentMediaTime()
+		keypressBadges.append(KeypressBadgeEffect(
+			id: UUID(),
+			globalPoint: anchor,
+			label: trimmed,
+			startTime: now
+		))
+		ensureDisplayTimer()
+	}
+
 	private func ensureDisplayTimer() {
 		if displayTimer != nil { return }
 		// 60Hz tick. Timer on the main run loop is good enough for a
@@ -596,7 +707,7 @@ final class OverlayController {
 	}
 
 	private func hasActiveEffects() -> Bool {
-		return !clickRings.isEmpty || !typeFlashes.isEmpty
+		return !clickRings.isEmpty || !typeFlashes.isEmpty || !keypressBadges.isEmpty
 	}
 
 	private func tick() {
@@ -613,6 +724,7 @@ final class OverlayController {
 		// Cull expired effects.
 		clickRings.removeAll { $0.isFinished(at: now) }
 		typeFlashes.removeAll { $0.isFinished(at: now) }
+		keypressBadges.removeAll { $0.isFinished(at: now) }
 
 		// Repaint with whatever cursor + effects are current.
 		let pointToRender = currentDisplayedGlobalPoint ?? lastGlobalPoint
@@ -647,6 +759,7 @@ final class OverlayController {
 				view.cursorPoint = nil
 				view.clickRings = []
 				view.typeFlashes = []
+				view.keypressBadges = []
 				view.needsDisplay = true
 				continue
 			}
@@ -675,6 +788,10 @@ final class OverlayController {
 				}
 				return ScreenLocalTypeFlash(localRect: rect, age: now - flash.startTime)
 			}
+			view.keypressBadges = keypressBadges.map { badge in
+				let local = convertGlobalToScreenLocal(badge.globalPoint, screen: screen)
+				return ScreenLocalKeypressBadge(localPoint: local, label: badge.label, age: now - badge.startTime)
+			}
 			view.needsDisplay = true
 		}
 	}
@@ -687,6 +804,7 @@ final class OverlayController {
 		// first; otherwise type-flash bounds; otherwise just render.
 		let anchor: CGPoint? = clickRings.first.map { $0.globalPoint }
 			?? typeFlashes.compactMap { $0.globalRect.map { CGPoint(x: $0.midX, y: $0.midY) } }.first
+			?? keypressBadges.first.map { $0.globalPoint }
 		let shouldRender = anchor.map { shouldRenderForCurrentTarget(at: $0) } ?? true
 
 		for (index, window) in windows.enumerated() {
@@ -696,6 +814,7 @@ final class OverlayController {
 			if !shouldRender {
 				view.clickRings = []
 				view.typeFlashes = []
+				view.keypressBadges = []
 				view.needsDisplay = true
 				continue
 			}
@@ -706,6 +825,10 @@ final class OverlayController {
 			view.typeFlashes = typeFlashes.compactMap { flash in
 				guard let g = flash.globalRect else { return nil }
 				return ScreenLocalTypeFlash(localRect: convertGlobalRectToScreenLocal(g, screen: screen), age: now - flash.startTime)
+			}
+			view.keypressBadges = keypressBadges.map { badge in
+				let local = convertGlobalToScreenLocal(badge.globalPoint, screen: screen)
+				return ScreenLocalKeypressBadge(localPoint: local, label: badge.label, age: now - badge.startTime)
 			}
 			view.needsDisplay = true
 		}
@@ -1061,6 +1184,17 @@ final class Bridge {
 				rect = CGRect(x: x, y: y, width: w, height: h)
 			}
 			OverlayController.shared.triggerTypeFlash(globalRect: rect, ownerPid: pid)
+			return ["triggered": OverlayController.shared.isEnabled()]
+		case "overlayKeypressEffect":
+			let label = try stringArg(request, "label")
+			let x = try? doubleArg(request, "x")
+			let y = try? doubleArg(request, "y")
+			let pid = optionalIntArg(request, "pid").map { pid_t($0) }
+			var point: CGPoint? = nil
+			if let x = x, let y = y {
+				point = CGPoint(x: x, y: y)
+			}
+			OverlayController.shared.triggerKeypressBadge(label: label, globalPoint: point, ownerPid: pid)
 			return ["triggered": OverlayController.shared.isEnabled()]
 		case "overlayConfigure":
 			if let style = optionalStringArg(request, "style") {
@@ -1773,7 +1907,35 @@ final class Bridge {
 			throw BridgeFailure(message: "keyPress requires at least one key", code: "invalid_args")
 		}
 		try postKeyPress(keys: keys, pid: targetPid)
+		// Visual: announce the key the agent just pressed via a small
+		// pill near the focused element (preferred) or near the cursor
+		// (fallback). If AX exposes no focus and we have no cursor
+		// history, the badge is silently dropped - we'd rather render
+		// nothing than render at (0,0).
+		let label = formatKeypressLabel(keys: keys)
+		let anchor = focusedElementAnchor(forPid: targetPid)
+		OverlayController.shared.triggerKeypressBadge(label: label, globalPoint: anchor, ownerPid: targetPid)
 		return ["pressed": true]
+	}
+
+	/// Compact label for a key array. One key passes through; many
+	/// collapses to `first ×N` so a burst of arrow keys reads as
+	/// `ArrowDown ×5` rather than spamming five badges. Keeps the
+	/// pill width bounded.
+	private func formatKeypressLabel(keys: [String]) -> String {
+		if keys.count == 1 { return keys[0] }
+		return "\(keys[0]) ×\(keys.count)"
+	}
+
+	/// Best-effort focused-element midpoint for badge anchoring.
+	/// Returns nil if the app exposes no focused element or its frame
+	/// is degenerate; caller falls back to last cursor position.
+	private func focusedElementAnchor(forPid pid: Int32) -> CGPoint? {
+		guard let element = focusedElementForPid(pid),
+			let frame = frameForElement(element),
+			frame.width > 1, frame.height > 1
+		else { return nil }
+		return CGPoint(x: frame.midX, y: frame.midY)
 	}
 
 	private func axPressAtPoint(_ request: [String: Any]) throws -> [String: Any] {
