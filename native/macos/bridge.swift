@@ -3801,7 +3801,17 @@ final class Bridge {
 			}
 		}
 
-		if semaphore.wait(timeout: .now() + .seconds(8)) == .timedOut {
+		// SCK fast-path. We give it 3s instead of the previous 8s -
+		// SCK is the high-quality path but it can wedge under load (two
+		// pi sessions racing, GPU-heavy frontmost app like a UTM VM,
+		// post-Sleep window-server thrash). The cgWindowScreenshot
+		// fallback below typically returns in 200ms and produces an
+		// image suitable for both vision and the agent's coordinate
+		// envelope. Net effect: bound the worst-case wait so we never
+		// burn pi's 25s helper-command timeout on SCK alone, leaving
+		// no headroom for the fallbacks. screencapture(8) is the final
+		// fallback (5s ceiling) for the rare case CG also returns nil.
+		if semaphore.wait(timeout: .now() + .seconds(3)) == .timedOut {
 			task.cancel()
 			if let payload = try cgWindowScreenshot(windowId: windowId) {
 				return payload
