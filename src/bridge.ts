@@ -2248,11 +2248,17 @@ interface CaptureResult {
 }
 
 function captureForTarget(target: ResolvedTarget): CurrentCapture {
+	// Predict 1:1 normalized dims (the helper's default output). When an
+	// image is actually fetched (image:always / fallback path / window
+	// exceeded cap), ensureCaptureImage overwrites these from the
+	// authoritative payload. Pre-normalize era this predicted retina
+	// dims via `framePoints.w * scaleFactor`; that's now wrong by 2x for
+	// every screenshot that doesn't fetch the image.
 	return {
 		stateId: randomStateId(),
-		width: Math.max(1, Math.round(target.framePoints.w * target.scaleFactor)),
-		height: Math.max(1, Math.round(target.framePoints.h * target.scaleFactor)),
-		scaleFactor: target.scaleFactor,
+		width: Math.max(1, Math.round(target.framePoints.w)),
+		height: Math.max(1, Math.round(target.framePoints.h)),
+		scaleFactor: 1,
 		timestamp: Date.now(),
 		windowWidth: target.framePoints.w,
 		windowHeight: target.framePoints.h,
