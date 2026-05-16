@@ -2428,7 +2428,10 @@ final class Bridge {
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
 		OverlayController.shared.triggerClickRing(globalPoint: point, button: .left, ownerPid: targetPid)
-		guard let hitElement = hitTestElement(at: point) else {
+		// PID-scoped hit-test so occlusion by other apps doesn't
+		// redirect the AX press to whatever sits on top. See note
+		// on hitTestElement(at:scopedToPid:).
+		guard let hitElement = hitTestElement(at: point, scopedToPid: targetPid) else {
 			return ["pressed": false, "reason": "hit_test_failed"]
 		}
 
@@ -2787,7 +2790,9 @@ final class Bridge {
 
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
-		guard let hitElement = hitTestElement(at: point) else {
+		// PID-scoped hit-test so occlusion by other apps doesn't
+		// redirect the AX focus to whatever sits on top.
+		guard let hitElement = hitTestElement(at: point, scopedToPid: targetPid) else {
 			return ["focused": false, "reason": "hit_test_failed"]
 		}
 
@@ -2827,7 +2832,11 @@ final class Bridge {
 		let scrollX = optionalIntArg(request, "scrollX") ?? 0
 		let scrollY = optionalIntArg(request, "scrollY") ?? 0
 		OverlayController.shared.triggerScrollEffect(globalPoint: point, deltaX: scrollX, deltaY: scrollY, ownerPid: targetPid)
-		guard let hitElement = hitTestElement(at: point) else {
+		// PID-scoped hit-test so occlusion by other apps doesn't
+		// redirect the scroll target to whatever sits on top. The
+		// agent's intent is "scroll the element under (x,y) in this
+		// app" regardless of which app's window is frontmost.
+		guard let hitElement = hitTestElement(at: point, scopedToPid: targetPid) else {
 			return ["scrolled": false, "reason": "hit_test_failed"]
 		}
 		return performScrollActionOrAncestor(startingAt: hitElement, targetPid: targetPid, scrollX: scrollX, scrollY: scrollY, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
@@ -2849,6 +2858,28 @@ final class Bridge {
 		let status = AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &hitElement)
 		guard status == .success, let hitElement else { return nil }
 		return hitElement
+	}
+
+	/// PID-scoped hit-test. AXUIElementCopyElementAtPosition on an
+	/// application element returns whichever element in that app
+	/// occupies the point — it ignores z-order occlusion by other
+	/// apps. This is what we want for the stealth contract: the
+	/// agent is targeting a specific window in a specific app, and
+	/// the fact that iTerm2 / Chrome / another app sits on top of
+	/// it must not redirect the AX action to that other app.
+	///
+	/// Falls back to the system-wide hit-test if the app element
+	/// returns nothing — some apps (heavy custom drawing, web
+	/// content) don't expose their content via AX at all, and the
+	/// system-wide path may still find something useful.
+	private func hitTestElement(at point: CGPoint, scopedToPid pid: Int32) -> AXUIElement? {
+		let appElement = AXUIElementCreateApplication(pid)
+		var hitElement: AXUIElement?
+		let status = AXUIElementCopyElementAtPosition(appElement, Float(point.x), Float(point.y), &hitElement)
+		if status == .success, let hitElement {
+			return hitElement
+		}
+		return nil
 	}
 
 	private func axActionName(_ actionName: String) throws -> CFString {
@@ -4037,18 +4068,48 @@ final class Bridge {
 			deltaY: deltaY,
 			ownerPid: pid
 		)
-		guard let event = CGEvent(
-			scrollWheelEvent2Source: nil,
-			units: .pixel,
-			wheelCount: 2,
-			wheel1: Int32(-deltaY),
-			wheel2: Int32(deltaX),
-			wheel3: 0
-		) else {
-			throw BridgeFailure(message: "Failed to create scroll event", code: "input_failed")
+		// We synthesize a 3-phase continuous gesture scroll: began,
+		// changed (with the actual delta), ended. Web content (Chrome,
+		// Safari) and modern NSScrollView gesture-based scroll
+		// handlers filter out events that don't carry phase info -
+		// without began/changed/ended bracketing, the web compositor
+		// silently drops the scroll. A plain non-continuous wheel
+		// event scrolls TextEdit fine but does nothing in Chrome.
+		// One bracketed continuous gesture handles both.
+		//
+		// Scroll-wheel events MUST go through the HID event tap to
+		// reach the right window. CGEvent.postToPid silently no-ops
+		// for scrolls because NSScrollView's gesture-based scroll
+		// handler only listens to events that came through the
+		// system HID pipeline. We move the system cursor to the
+		// target point first (postMouseMove above), so the
+		// HID-tapped scroll lands on the right window via the same
+		// hit-test the trackpad would use - without raising or
+		// activating the app. Focus stays on whatever window was
+		// previously key; the cursor is the only thing that moves,
+		// and we already move it for clicks too. Stealth contract
+		// preserved.
+		let phases: [(phase: Int64, dy: Int32, dx: Int32)] = [
+			(1, 0, 0),                                  // kCGScrollPhaseBegan
+			(2, Int32(-deltaY), Int32(deltaX)),         // kCGScrollPhaseChanged
+			(4, 0, 0),                                  // kCGScrollPhaseEnded
+		]
+		for (phase, dy, dx) in phases {
+			guard let event = CGEvent(
+				scrollWheelEvent2Source: nil,
+				units: .pixel,
+				wheelCount: 2,
+				wheel1: dy,
+				wheel2: dx,
+				wheel3: 0
+			) else {
+				throw BridgeFailure(message: "Failed to create scroll event", code: "input_failed")
+			}
+			event.location = point
+			event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+			event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+			event.post(tap: .cghidEventTap)
 		}
-		event.location = point
-		postEvent(event, pid: pid)
 	}
 
 	private func modifierFlag(_ key: String) -> CGEventFlags? {
