@@ -239,6 +239,14 @@ struct ScreenLocalWindowPulse {
 final class OverlayCursorView: NSView {
 	var cursorPoint: CGPoint? = nil
 	var cursorSize: CGFloat = 28
+	// Alpha for the cursor glyph and its drop shadow. Driven by the
+	// OverlayController's idle-fade logic so the cursor melts away
+	// after the agent stops acting instead of squatting on screen
+	// for the rest of the pi session. Effects (clicks, type flashes,
+	// keypress badges, scroll chevrons, window pulses) ignore this
+	// alpha and fade on their own envelopes - they're transient
+	// announcements, not persistent state.
+	var cursorAlpha: CGFloat = 1.0
 	var clickRings: [ScreenLocalClickRing] = []
 	var typeFlashes: [ScreenLocalTypeFlash] = []
 	var keypressBadges: [ScreenLocalKeypressBadge] = []
@@ -267,6 +275,10 @@ final class OverlayCursorView: NSView {
 		drawKeypressBadges(ctx)
 
 		guard let point = cursorPoint else { return }
+		// Honor the idle-fade alpha. cursorAlpha <= 0 means "agent
+		// idle long enough to fully fade" - skip drawing entirely so
+		// we don't waste a save/restore + path build per tick.
+		if cursorAlpha <= 0.0 { return }
 
 		// scale = cursorSize / svgViewBoxSize so the rendered icon is
 		// `cursorSize` points wide along its viewBox dimension.
@@ -282,6 +294,11 @@ final class OverlayCursorView: NSView {
 			x: point.x - OverlayCursorView.svgAnchorX * scale,
 			y: point.y - (OverlayCursorView.svgViewBoxSize - OverlayCursorView.svgAnchorY) * scale
 		)
+
+		// Apply the idle-fade alpha globally for cursor + shadow so
+		// the whole glyph fades together. The shadow's own opacity
+		// (0.35) gets multiplied through this layer alpha.
+		ctx.setAlpha(cursorAlpha)
 
 		// Soft drop shadow under the whole shape.
 		ctx.saveGState()
@@ -702,6 +719,26 @@ final class OverlayController {
 	var animationStyle: OverlayAnimationStyle = .arc
 	var animationDuration: CFTimeInterval = 0.180
 
+	// Idle-fade tunables. The cursor used to persist on screen for
+	// the rest of the pi session - visually distracting clutter long
+	// after the agent stopped acting. After `cursorIdleFadeStart`
+	// seconds of no agent activity (no moveTo, no trigger*), the
+	// cursor fades to fully invisible over `cursorIdleFadeDuration`
+	// seconds. Next agent action snaps it back instantly.
+	//
+	// Activity = anything the agent intentionally did on screen:
+	// move/click/type/keypress/scroll/drag/focus-sync/window-pulse.
+	// Every trigger* call hits bumpActivity, so any in-flight effect
+	// (scroll chevrons, keypress badge, window pulse, type flash,
+	// click ring) resets the idle clock - the cursor stays put
+	// while the agent is still doing stuff.
+	var cursorIdleFadeStart: CFTimeInterval = 20.0
+	var cursorIdleFadeDuration: CFTimeInterval = 0.5
+
+	// Timestamp of the most recent agent activity. nil means we have
+	// no idle clock yet (overlay just enabled, or fade completed).
+	private var lastActivityTime: CFTimeInterval? = nil
+
 	// When true, the overlay hides itself any time the agent's target
 	// app is not the topmost window under the cursor. Default on; set
 	// to false to restore the always-visible legacy behavior.
@@ -774,6 +811,9 @@ final class OverlayController {
 		lastGlobalPoint = globalPoint
 		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
+		// Reset the idle clock - cursor pops back to full opacity
+		// immediately on any agent move.
+		bumpActivity()
 
 		// If we have no prior position, animation is off, or caller
 		// asked for an instant snap (drag waypoints), just snap. The
@@ -840,6 +880,7 @@ final class OverlayController {
 	func triggerClickRing(globalPoint: CGPoint, button: CursorEffectButton, count: Int = 1, ownerPid: pid_t? = nil) {
 		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
+		bumpActivity()
 		let now = CACurrentMediaTime()
 		let stamped = max(1, min(5, count))
 		for i in 0..<stamped {
@@ -860,6 +901,7 @@ final class OverlayController {
 	func triggerTypeFlash(globalRect: CGRect?, ownerPid: pid_t? = nil) {
 		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
+		bumpActivity()
 		let now = CACurrentMediaTime()
 		typeFlashes.append(TypeFlashEffect(
 			id: UUID(),
@@ -878,6 +920,7 @@ final class OverlayController {
 	func triggerKeypressBadge(label: String, globalPoint: CGPoint? = nil, ownerPid: pid_t? = nil) {
 		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
+		bumpActivity()
 		let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
 		if trimmed.isEmpty { return }
 		guard let anchor = globalPoint ?? lastGlobalPoint else { return }
@@ -900,6 +943,7 @@ final class OverlayController {
 		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
 		if deltaX == 0 && deltaY == 0 { return }
+		bumpActivity()
 
 		// Agent convention from the scroll tool docstring: positive
 		// scrollY = scroll DOWN, negative = scroll UP.
@@ -950,12 +994,49 @@ final class OverlayController {
 		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
 		if globalFrame.width < 4 || globalFrame.height < 4 { return }
+		// Window pulses are frame-anchored, not cursor-anchored, but
+		// they still represent agent activity - keep the cursor (if
+		// any) fresh while a pulse is in-flight.
+		bumpActivity()
 		windowPulses.append(WindowPulseEffect(
 			id: UUID(),
 			globalFrame: globalFrame,
 			startTime: CACurrentMediaTime()
 		))
 		ensureDisplayTimer()
+	}
+
+	/// Reset the idle clock and (if needed) start the display timer
+	/// so the cursor pops back to full opacity on the next tick. Cheap
+	/// to call on every agent move/click/key/scroll/pulse - the work
+	/// is one CFTimeInterval write plus an idempotent timer ensure.
+	private func bumpActivity() {
+		lastActivityTime = CACurrentMediaTime()
+		ensureDisplayTimer()
+	}
+
+	/// Current idle-fade alpha for the cursor based on time since the
+	/// last agent activity. Returns 1.0 inside the hold window,
+	/// linearly fades to 0.0 across cursorIdleFadeDuration, then
+	/// stays at 0.0. Returns 1.0 when we have no activity timestamp
+	/// at all (overlay just enabled - first action will set it).
+	private func currentCursorAlpha(now: CFTimeInterval) -> CGFloat {
+		guard let last = lastActivityTime else { return 1.0 }
+		let idle = now - last
+		if idle <= cursorIdleFadeStart { return 1.0 }
+		let fadeProgress = (idle - cursorIdleFadeStart) / cursorIdleFadeDuration
+		if fadeProgress >= 1.0 { return 0.0 }
+		return CGFloat(1.0 - fadeProgress)
+	}
+
+	/// True while the cursor is still partially visible OR still
+	/// inside the hold window before fading begins. Keeps the 60Hz
+	/// tick alive so the fade animation actually plays - if the timer
+	/// shut down at the end of the last effect, the cursor would
+	/// freeze at full alpha forever.
+	private func cursorNeedsIdleTick(now: CFTimeInterval) -> Bool {
+		guard lastActivityTime != nil else { return false }
+		return currentCursorAlpha(now: now) > 0.0
 	}
 
 	private func ensureDisplayTimer() {
@@ -973,11 +1054,14 @@ final class OverlayController {
 
 	private func cancelAnimation() {
 		animation = nil
-		// Don't kill the timer if effects still need ticking. The timer
-		// shutdown logic in `tick` checks both animation + effects so a
-		// click-ring fired right before the cursor finishes its tween
-		// keeps animating to completion.
-		if !hasActiveEffects() {
+		// Don't kill the timer if effects still need ticking OR the
+		// idle-fade still needs ticks to paint the fade. Without the
+		// fade check, the snap path of moveTo (no prior point) would
+		// cancelAnimation -> kill the timer right after bumpActivity
+		// scheduled it, leaving the cursor frozen at full alpha
+		// forever. The timer shutdown logic in `tick` is the
+		// canonical place that decides when to actually stop.
+		if !hasActiveEffectsOrFade(now: CACurrentMediaTime()) {
 			displayTimer?.invalidate()
 			displayTimer = nil
 		}
@@ -985,6 +1069,16 @@ final class OverlayController {
 
 	private func hasActiveEffects() -> Bool {
 		return !clickRings.isEmpty || !typeFlashes.isEmpty || !keypressBadges.isEmpty || !scrollEffects.isEmpty || !windowPulses.isEmpty
+	}
+
+	/// hasActiveEffects + cursor still needing redraws (mid-fade or
+	/// still in the hold window). Used by tick to decide whether to
+	/// shut the 60Hz timer down. We need the cursor's idle fade to
+	/// keep the timer alive even after all effects have culled,
+	/// otherwise the tween stops at full alpha and the cursor squats
+	/// on screen.
+	private func hasActiveEffectsOrFade(now: CFTimeInterval) -> Bool {
+		return hasActiveEffects() || cursorNeedsIdleTick(now: now)
 	}
 
 	private func tick() {
@@ -1013,7 +1107,19 @@ final class OverlayController {
 			renderEmpty(now: now)
 		}
 
-		if animation == nil && !hasActiveEffects() {
+		// If the cursor's idle fade has fully landed at 0 alpha,
+		// also drop the displayed point so the next bumpActivity
+		// starts cleanly without a stale anchor. lastGlobalPoint
+		// stays - it's the agent's last logical target and the
+		// next moveTo may want it as a tween-start anchor.
+		if lastActivityTime != nil && currentCursorAlpha(now: now) <= 0.0 {
+			currentDisplayedGlobalPoint = nil
+			// Clear the activity timestamp so future ticks don't
+			// keep doing the fade math forever.
+			lastActivityTime = nil
+		}
+
+		if animation == nil && !hasActiveEffectsOrFade(now: now) {
 			displayTimer?.invalidate()
 			displayTimer = nil
 		}
@@ -1058,6 +1164,9 @@ final class OverlayController {
 			} else {
 				view.cursorPoint = nil
 			}
+			// Push the current idle-fade alpha so the view draws
+			// the cursor at the right opacity this frame.
+			view.cursorAlpha = currentCursorAlpha(now: now)
 			view.clickRings = clickRings.compactMap { ring in
 				let local = convertGlobalToScreenLocal(ring.globalPoint, screen: screen)
 				return ScreenLocalClickRing(
