@@ -399,7 +399,12 @@ interface FrontmostResult {
 }
 
 interface ScreenshotPayload {
+	// Base64-encoded image bytes. Field name is historical; the
+	// helper sends JPEG by default (see `mimeType`) and used to send
+	// PNG. Renaming the field would break older helper builds, so we
+	// kept the wire name and added `mimeType` to disambiguate.
 	pngBase64: string;
+	mimeType: string;
 	width: number;
 	height: number;
 	scaleFactor: number;
@@ -2102,8 +2107,14 @@ async function helperScreenshot(windowId: number, signal?: AbortSignal): Promise
 		throw new Error("Helper returned an invalid screenshot payload.");
 	}
 
+	// Older helper builds (pre-JPEG switch) didn't send a mimeType and
+	// always encoded PNG. Default to image/png in that case so the
+	// extension keeps working with stale helpers between releases.
+	const mimeType = toOptionalString(result?.imageMimeType) ?? "image/png";
+
 	return {
 		pngBase64: base64,
+		mimeType,
 		width: Math.max(1, Math.trunc(toFiniteNumber(result?.width, 1))),
 		height: Math.max(1, Math.trunc(toFiniteNumber(result?.height, 1))),
 		scaleFactor: Math.max(1, toFiniteNumber(result?.scaleFactor, 1)),
@@ -2369,7 +2380,7 @@ async function buildToolResult(
 		: "";
 	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${markerText}${summary}${coordsLine}${axTargetText}${fallbackText}${appInstructionsText}` }];
 	if (fallbackReason) {
-		content.push({ type: "image", data: result.image!.pngBase64, mimeType: "image/png" });
+		content.push({ type: "image", data: result.image!.pngBase64, mimeType: result.image!.mimeType });
 	}
 
 	return { content, details };

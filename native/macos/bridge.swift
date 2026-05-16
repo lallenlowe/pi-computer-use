@@ -3848,7 +3848,7 @@ final class Bridge {
 		return try screenshotPayload(image: image, windowId: windowId)
 	}
 
-	// Cap on the longest image edge before PNG encoding. Vertex AI rejects
+	// Cap on the longest image edge before encoding. Vertex AI rejects
 	// many-image requests when any one image exceeds 2576 px/side (observed
 	// empirically: "image dimensions exceed max allowed size for many-image
 	// requests: 2576 pixels"). Anthropic publishes a 1568 recommendation but
@@ -3858,10 +3858,23 @@ final class Bridge {
 	// fallback aid.
 	private static let maxImageEdgePixels: Int = 2576
 
+	// JPEG quality for screenshot encoding. UTM/Chrome/full-window
+	// screenshots routinely come out at 2.5MB as PNG; the same image
+	// at JPEG q75 lands around 320KB - 8x smaller. Vertex's 30MB
+	// per-request cap was hitting around 8 PNG screenshots into a
+	// long session; q75 gives us closer to 80 before the cap. Quality
+	// is plenty for vision-fallback (the agent reads coordinates from
+	// the AX envelope, not the image, so we're not penalising any
+	// useful precision). PNG is still used for screenshots that
+	// require lossless detail in the future via a needsLossless
+	// override - none today, but the helper keeps both code paths.
+	private static let jpegQuality: Double = 0.75
+
 	private func screenshotPayload(image: CGImage, windowId: UInt32) throws -> [String: Any] {
 		let downscaled = downscaleIfNeeded(image)
-		guard let pngData = NSBitmapImageRep(cgImage: downscaled).representation(using: .png, properties: [:]) else {
-			throw BridgeFailure(message: "Failed to encode screenshot as PNG", code: "encoding_failed")
+		let rep = NSBitmapImageRep(cgImage: downscaled)
+		guard let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: NSNumber(value: Self.jpegQuality)]) else {
+			throw BridgeFailure(message: "Failed to encode screenshot as JPEG", code: "encoding_failed")
 		}
 
 		// Derive scaleFactor by comparing the *returned* image's pixel
@@ -3882,7 +3895,13 @@ final class Bridge {
 		}
 
 		var payload: [String: Any] = [
-			"pngBase64": pngData.base64EncodedString(),
+			// Field name kept as `pngBase64` for backward request-shape
+			// compat with older TS callers; payload is JPEG bytes. New
+			// `imageMimeType` field tells current callers what to set on
+			// the agent message. TS uses imageMimeType when present and
+			// falls back to image/png for older helper builds.
+			"pngBase64": jpegData.base64EncodedString(),
+			"imageMimeType": "image/jpeg",
 			"width": downscaled.width,
 			"height": downscaled.height,
 			"scaleFactor": scale,
