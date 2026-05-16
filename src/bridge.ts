@@ -2411,7 +2411,7 @@ async function buildToolResult(
 	// models routinely read pixel coords off the image and silently
 	// miss by ~2x.
 	const coordsLine = tool === "screenshot"
-		? `\n\nCoords: window ${Math.round(result.capture.windowWidth)}x${Math.round(result.capture.windowHeight)} pts | image ${result.capture.width}x${result.capture.height} px | scale ${(result.capture.scaleFactor || 1).toFixed(2)}. Click/move/drag/scroll x,y are LOGICAL POINTS in [0..${Math.round(result.capture.windowWidth)}, 0..${Math.round(result.capture.windowHeight)}]. If you read a coordinate off the image, divide by scale before passing it.`
+		? `\n\nCoords: window ${Math.round(result.capture.windowWidth)}x${Math.round(result.capture.windowHeight)} pts | image ${result.capture.width}x${result.capture.height} px | scale ${(result.capture.scaleFactor || 1).toFixed(2)}. Click/move/drag/scroll x,y are LOGICAL POINTS in [0..${Math.round(result.capture.windowWidth)}, 0..${Math.round(result.capture.windowHeight)}]. The image has logical-pt RULER TICKS along the top and left edges (major every 50, minor every 25) - read the labels directly to get x,y; no scale math required.`
 		: "";
 	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${markerText}${summary}${coordsLine}${axTargetText}${fallbackText}${appInstructionsText}` }];
 	if (fallbackReason) {
