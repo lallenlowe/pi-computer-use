@@ -156,6 +156,25 @@ struct ScrollEffect {
 	}
 }
 
+/// One "agent operated on this window" outline pulse. Anchored to a
+/// global window frame (CG coords, top-left origin) and rendered as
+/// two outward-expanding rounded outlines that fade out together.
+/// Used by surfaceWindow / launchApp({activate:true}) / setWindowFrame
+/// to give the user an unmistakable "target acquired / window
+/// arranged" signal that ties the visible window state change to the
+/// agent's intent. Color is amber/gold per the documented action
+/// color language (focus/window state = amber).
+struct WindowPulseEffect {
+	let id: UUID
+	let globalFrame: CGRect
+	let startTime: CFTimeInterval
+	static let duration: CFTimeInterval = 0.900
+
+	func isFinished(at now: CFTimeInterval) -> Bool {
+		return now - startTime >= WindowPulseEffect.duration
+	}
+}
+
 /// Pre-converted, per-screen-local effect descriptors that the view
 /// renders on each draw. The OverlayController owns effects in global
 /// CG coords and walks them per-screen at render time, mirroring how
@@ -185,6 +204,11 @@ struct ScreenLocalScrollEffect {
 	let age: CFTimeInterval
 }
 
+struct ScreenLocalWindowPulse {
+	let localRect: CGRect
+	let age: CFTimeInterval
+}
+
 /// Custom NSView that paints the agent's virtual cursor at the
 /// configured screen-local point. Renders a paper-airplane shape
 /// translated from `assets/cursor.svg` (600x600 viewBox) into native
@@ -202,6 +226,7 @@ final class OverlayCursorView: NSView {
 	var typeFlashes: [ScreenLocalTypeFlash] = []
 	var keypressBadges: [ScreenLocalKeypressBadge] = []
 	var scrollEffects: [ScreenLocalScrollEffect] = []
+	var windowPulses: [ScreenLocalWindowPulse] = []
 
 	// SVG viewBox dims and the in-viewBox coords of the click hotspot.
 	// Kept as named constants so the path-translation math reads
@@ -218,6 +243,7 @@ final class OverlayCursorView: NSView {
 
 		// Effects render *behind* the cursor so the cursor never gets
 		// occluded by the very thing it's announcing.
+		drawWindowPulses(ctx)
 		drawTypeFlashes(ctx)
 		drawClickRings(ctx)
 		drawScrollEffects(ctx)
@@ -463,6 +489,56 @@ final class OverlayCursorView: NSView {
 		}
 	}
 
+	/// Render every currently-active window pulse as a pair of
+	/// expanding rounded outlines around the window's frame. Two
+	/// concentric strokes — the inner one slightly inset, the outer
+	/// growing outward over the lifetime — read as a "target
+	/// acquired" pulse rather than a single static outline. Color is
+	/// amber/gold per the documented action color language
+	/// (focus / window state changes).
+	private func drawWindowPulses(_ ctx: CGContext) {
+		for pulse in windowPulses {
+			let t = max(0.0, min(1.0, pulse.age / WindowPulseEffect.duration))
+			let eased = OverlayController.easeOutCubic(t)
+
+			// Two-pulse envelope: full alpha for the first 25%, fade
+			// out across the remaining 75%. Long enough to register
+			// across a Spaces transition / app-activation flash but
+			// short enough not to feel like decoration.
+			let alpha: CGFloat
+			if t < 0.25 {
+				alpha = 1.0
+			} else {
+				alpha = CGFloat((1.0 - t) / 0.75)
+			}
+			if alpha <= 0 { continue }
+
+			// Outer pulse: starts flush with the frame and expands
+			// outward by up to ~12pt as it ages.
+			let expand: CGFloat = 12.0 * CGFloat(eased)
+			let outerRect = pulse.localRect.insetBy(dx: -expand, dy: -expand)
+			let outerPath = NSBezierPath(roundedRect: outerRect, xRadius: 10, yRadius: 10)
+
+			// Amber/gold (the documented "focus / window state"
+			// color in the agent action language).
+			let amber = NSColor(calibratedRed: 1.000, green: 0.749, blue: 0.247, alpha: alpha)
+			amber.setStroke()
+			outerPath.lineWidth = 3.0
+			outerPath.stroke()
+
+			// Inner pulse: starts inset and contracts toward the
+			// frame as it ages. Two opposing strokes give the
+			// "target reticule closing in" feel without needing
+			// crosshairs or any extra ornament.
+			let inset: CGFloat = 6.0 * CGFloat(1.0 - eased)
+			let innerRect = pulse.localRect.insetBy(dx: inset, dy: inset)
+			let innerPath = NSBezierPath(roundedRect: innerRect, xRadius: 8, yRadius: 8)
+			amber.withAlphaComponent(alpha * 0.55).setStroke()
+			innerPath.lineWidth = 1.5
+			innerPath.stroke()
+		}
+	}
+
 	/// Build the cursor outline as an NSBezierPath at the given scale.
 	/// Path commands are the SVG `d` attribute from assets/cursor.svg,
 	/// translated to NSBezierPath calls. SVG y is top-down; we y-flip
@@ -590,6 +666,7 @@ final class OverlayController {
 	private var typeFlashes: [TypeFlashEffect] = []
 	private var keypressBadges: [KeypressBadgeEffect] = []
 	private var scrollEffects: [ScrollEffect] = []
+	private var windowPulses: [WindowPulseEffect] = []
 	private var displayTimer: Timer? = nil
 	private var screenChangeObserver: NSObjectProtocol? = nil
 
@@ -642,6 +719,7 @@ final class OverlayController {
 		typeFlashes.removeAll()
 		keypressBadges.removeAll()
 		scrollEffects.removeAll()
+		windowPulses.removeAll()
 		currentDisplayedGlobalPoint = nil
 		if let observer = screenChangeObserver {
 			NotificationCenter.default.removeObserver(observer)
@@ -843,6 +921,26 @@ final class OverlayController {
 		ensureDisplayTimer()
 	}
 
+	/// Fire an amber outline pulse around a window's frame. Used by
+	/// surfaceWindow / launchApp({activate:true}) / setWindowFrame to
+	/// give the user a "target acquired" or "window arranged" cue tied
+	/// to the agent's intent. The frame is in CG global coords (top-
+	/// left origin); convertGlobalRectToScreenLocal flips it per-screen
+	/// at render time. No-op when the overlay is off, when the frame
+	/// has zero area (off-Space windows often report 0x0 from AX), or
+	/// when the overlay is occluded by a non-target window.
+	func triggerWindowPulse(globalFrame: CGRect, ownerPid: pid_t? = nil) {
+		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
+		if !enabled { return }
+		if globalFrame.width < 4 || globalFrame.height < 4 { return }
+		windowPulses.append(WindowPulseEffect(
+			id: UUID(),
+			globalFrame: globalFrame,
+			startTime: CACurrentMediaTime()
+		))
+		ensureDisplayTimer()
+	}
+
 	private func ensureDisplayTimer() {
 		if displayTimer != nil { return }
 		// 60Hz tick. Timer on the main run loop is good enough for a
@@ -869,7 +967,7 @@ final class OverlayController {
 	}
 
 	private func hasActiveEffects() -> Bool {
-		return !clickRings.isEmpty || !typeFlashes.isEmpty || !keypressBadges.isEmpty || !scrollEffects.isEmpty
+		return !clickRings.isEmpty || !typeFlashes.isEmpty || !keypressBadges.isEmpty || !scrollEffects.isEmpty || !windowPulses.isEmpty
 	}
 
 	private func tick() {
@@ -888,6 +986,7 @@ final class OverlayController {
 		typeFlashes.removeAll { $0.isFinished(at: now) }
 		keypressBadges.removeAll { $0.isFinished(at: now) }
 		scrollEffects.removeAll { $0.isFinished(at: now) }
+		windowPulses.removeAll { $0.isFinished(at: now) }
 
 		// Repaint with whatever cursor + effects are current.
 		let pointToRender = currentDisplayedGlobalPoint ?? lastGlobalPoint
@@ -924,6 +1023,7 @@ final class OverlayController {
 				view.typeFlashes = []
 				view.keypressBadges = []
 				view.scrollEffects = []
+				view.windowPulses = []
 				view.needsDisplay = true
 				continue
 			}
@@ -960,6 +1060,10 @@ final class OverlayController {
 				let local = convertGlobalToScreenLocal(effect.globalPoint, screen: screen)
 				return ScreenLocalScrollEffect(localPoint: local, dx: effect.dx, dy: effect.dy, chevronCount: effect.chevronCount, age: now - effect.startTime)
 			}
+			view.windowPulses = windowPulses.map { pulse in
+				let rect = convertGlobalRectToScreenLocal(pulse.globalFrame, screen: screen)
+				return ScreenLocalWindowPulse(localRect: rect, age: now - pulse.startTime)
+			}
 			if forceSynchronousDisplay {
 				// Synchronous redraw — used by the drag waypoint path
 				// where the main thread is held in a tight usleep loop
@@ -989,6 +1093,7 @@ final class OverlayController {
 			?? typeFlashes.compactMap { $0.globalRect.map { CGPoint(x: $0.midX, y: $0.midY) } }.first
 			?? keypressBadges.first.map { $0.globalPoint }
 			?? scrollEffects.first.map { $0.globalPoint }
+			?? windowPulses.first.map { CGPoint(x: $0.globalFrame.midX, y: $0.globalFrame.midY) }
 		let shouldRender = anchor.map { shouldRenderForCurrentTarget(at: $0) } ?? true
 
 		for (index, window) in windows.enumerated() {
@@ -1000,6 +1105,7 @@ final class OverlayController {
 				view.typeFlashes = []
 				view.keypressBadges = []
 				view.scrollEffects = []
+				view.windowPulses = []
 				view.needsDisplay = true
 				continue
 			}
@@ -1018,6 +1124,10 @@ final class OverlayController {
 			view.scrollEffects = scrollEffects.map { effect in
 				let local = convertGlobalToScreenLocal(effect.globalPoint, screen: screen)
 				return ScreenLocalScrollEffect(localPoint: local, dx: effect.dx, dy: effect.dy, chevronCount: effect.chevronCount, age: now - effect.startTime)
+			}
+			view.windowPulses = windowPulses.map { pulse in
+				let rect = convertGlobalRectToScreenLocal(pulse.globalFrame, screen: screen)
+				return ScreenLocalWindowPulse(localRect: rect, age: now - pulse.startTime)
 			}
 			view.needsDisplay = true
 		}
@@ -1393,6 +1503,14 @@ final class Bridge {
 			let pid = optionalIntArg(request, "pid").map { pid_t($0) }
 			OverlayController.shared.triggerScrollEffect(globalPoint: CGPoint(x: x, y: y), deltaX: dx, deltaY: dy, ownerPid: pid)
 			return ["triggered": OverlayController.shared.isEnabled()]
+		case "overlayWindowPulse":
+			let x = try doubleArg(request, "x")
+			let y = try doubleArg(request, "y")
+			let width = try doubleArg(request, "width")
+			let height = try doubleArg(request, "height")
+			let pid = optionalIntArg(request, "pid").map { pid_t($0) }
+			OverlayController.shared.triggerWindowPulse(globalFrame: CGRect(x: x, y: y, width: width, height: height), ownerPid: pid)
+			return ["triggered": OverlayController.shared.isEnabled()]
 		case "overlayConfigure":
 			if let style = optionalStringArg(request, "style") {
 				OverlayController.shared.animationStyle = OverlayAnimationStyle(style)
@@ -1604,6 +1722,13 @@ final class Bridge {
 		let positionStatus = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, originValue)
 		let sizeStatus = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
 		let frame = frameForWindow(window)
+		// Slice 21: amber pulse around the new window frame so an
+		// arrange_window action ties the visible move/resize to the
+		// agent's intent. Only fire if at least one AX setter succeeded
+		// (so a "failed both" call doesn't paint a misleading cue).
+		if (positionStatus == .success || sizeStatus == .success) && frame.width > 0 && frame.height > 0 {
+			OverlayController.shared.triggerWindowPulse(globalFrame: frame, ownerPid: pid)
+		}
 		return [
 			"ok": positionStatus == .success || sizeStatus == .success,
 			"positionStatus": Int(positionStatus.rawValue),
@@ -1871,6 +1996,20 @@ final class Bridge {
 			}
 		}
 
+		// Slice 21: amber pulse around the surfaced window's frame so
+		// the user sees a visible "target acquired" tie-in to the
+		// agent's surface_window call (which they just approved via
+		// ctx.ui.confirm). Fire AFTER the settle loop so the window is
+		// actually onscreen on the active Space when the pulse paints,
+		// not mid-transition. Re-read the AX frame post-settle in case
+		// the Space switch reflowed the window (some apps revalidate).
+		if let axWindow, appActivated || windowRaised {
+			let frame = frameForWindow(axWindow)
+			if frame.width > 0 && frame.height > 0 {
+				OverlayController.shared.triggerWindowPulse(globalFrame: frame, ownerPid: pid)
+			}
+		}
+
 		var result: [String: Any] = [
 			"pid": Int(pid),
 			"appActivated": appActivated,
@@ -1924,6 +2063,14 @@ final class Bridge {
 			if activate {
 				didActivate = existing.activate(options: [])
 			}
+			// Slice 21: amber pulse around the activated app's main
+			// window so the foreground takeover ties to the agent's
+			// launch_app({activate:true}) intent. Skip when activate=
+			// false: a background launch produces no visible window
+			// state change so the pulse would be misleading.
+			if didActivate, let frame = primaryWindowFrame(forPid: existing.processIdentifier) {
+				OverlayController.shared.triggerWindowPulse(globalFrame: frame, ownerPid: existing.processIdentifier)
+			}
 			return [
 				"pid": Int(existing.processIdentifier),
 				"appName": existing.localizedName ?? appName ?? appURL.lastPathComponent,
@@ -1959,6 +2106,26 @@ final class Bridge {
 			throw BridgeFailure(message: "launchApp returned no NSRunningApplication.", code: "launch_failed")
 		}
 
+		// Slice 21: amber pulse around the launched app's main window
+		// so a foreground launch ties to the agent's intent. Fresh
+		// launches need a brief settle before AX exposes the window;
+		// poll up to 1.5s for a usable frame, then pulse. Skip when
+		// activate=false (background launch produces no visible window
+		// state change worth pulsing).
+		if activate {
+			var pulseFrame: CGRect? = nil
+			for _ in 0..<30 {
+				if let frame = primaryWindowFrame(forPid: launchedApp.processIdentifier) {
+					pulseFrame = frame
+					break
+				}
+				Thread.sleep(forTimeInterval: 0.05)
+			}
+			if let pulseFrame {
+				OverlayController.shared.triggerWindowPulse(globalFrame: pulseFrame, ownerPid: launchedApp.processIdentifier)
+			}
+		}
+
 		return [
 			"pid": Int(launchedApp.processIdentifier),
 			"appName": launchedApp.localizedName ?? appName ?? appURL.lastPathComponent,
@@ -1966,6 +2133,33 @@ final class Bridge {
 			"alreadyRunning": false,
 			"activated": activate,
 		]
+	}
+
+	/// Best-effort "give me the main window's frame" probe for a pid.
+	/// Used by launchApp's slice-21 pulse: returns the AX-reported
+	/// frame of whichever window is marked main / focused / first,
+	/// or nil if the app has no AX-visible windows yet (common during
+	/// the first ~500ms of a cold launch).
+	private func primaryWindowFrame(forPid pid: pid_t) -> CGRect? {
+		ensureEnhancedAccessibility(pid: pid)
+		let appElement = AXUIElementCreateApplication(pid)
+		AXUIElementSetMessagingTimeout(appElement, 1.0)
+		let windows = axElementArray(appElement, attribute: kAXWindowsAttribute as CFString)
+		if windows.isEmpty { return nil }
+		for window in windows {
+			if boolAttribute(window, attribute: kAXMainAttribute as CFString) == true {
+				let frame = frameForWindow(window)
+				if frame.width > 0 && frame.height > 0 { return frame }
+			}
+		}
+		for window in windows {
+			if boolAttribute(window, attribute: kAXFocusedAttribute as CFString) == true {
+				let frame = frameForWindow(window)
+				if frame.width > 0 && frame.height > 0 { return frame }
+			}
+		}
+		let frame = frameForWindow(windows[0])
+		return (frame.width > 0 && frame.height > 0) ? frame : nil
 	}
 
 	/// Shared resolver for wakeWindow / surfaceWindow. Returns the
