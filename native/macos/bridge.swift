@@ -4043,8 +4043,48 @@ final class Bridge {
 		return CGRect(x: x, y: y, width: w, height: h)
 	}
 
+	/// Deliver a synthesized input event to a target app.
+	///
+	/// Two paths:
+	///   1. **postToPid** — the stealth path. Event enters the target
+	///      process's event queue directly. Doesn't change frontmost,
+	///      doesn't move keyboard focus, doesn't bleed onto other apps.
+	///      Works fine for clicks/keys/moves into Cocoa apps that
+	///      dispatch from their own event queue.
+	///   2. **cghidEventTap** — the HID path. Event enters at the
+	///      bottom of the system event pipeline, gets phase tagging,
+	///      passes through the system arbiter, lands on whichever
+	///      window is under the cursor. This is how a real mouse or
+	///      trackpad delivers input. Apps that grab HID-level input
+	///      (VMs like UTM/Parallels/VMware, games, anything using
+	///      CGEventTap subscriptions, web-content compositors) only
+	///      respond to events that came through this path.
+	///
+	/// We default to postToPid because it preserves the stealth
+	/// contract (input ops never steal focus, never bleed onto non-
+	/// target apps). But when the target app is **already frontmost**,
+	/// stealth is moot — the user has the app active anyway — and we
+	/// upgrade to cghidEventTap to unlock the HID-grabbing apps. The
+	/// caller's postMouseMove already parked the system cursor at the
+	/// event location, so HID routing lands on the right window.
+	///
+	/// scrollWheel events bypass this helper entirely and always go
+	/// through cghidEventTap (see postScrollWheel) because postToPid
+	/// silently no-ops for scroll across the board, frontmost or not.
 	private func postEvent(_ event: CGEvent, pid: Int32) {
-		event.postToPid(pid)
+		if isFrontmost(pid: pid) {
+			event.post(tap: .cghidEventTap)
+		} else {
+			event.postToPid(pid)
+		}
+	}
+
+	/// True when `pid` owns the currently frontmost application. Used
+	/// by postEvent to decide between per-PID delivery (stealth) and
+	/// HID-tap delivery (compatible with VMs / games / web compositors).
+	private func isFrontmost(pid: Int32) -> Bool {
+		guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
+		return frontmost.processIdentifier == pid
 	}
 
 	private func postMouseMove(to point: CGPoint, pid: Int32) throws {
