@@ -4009,6 +4009,38 @@ export async function executeAppleScript(
 	});
 }
 
+/**
+ * Slice 22: fire the amber window pulse around an app's primary window
+ * so an `apple_script` invocation against that app ties visibly to the
+ * agent's intent. AppleScript runs entirely in the host pi process via
+ * `osascript` so the bridge has no idea what it's doing internally;
+ * this gives the user a "hey, an AppleScript ran against this app"
+ * visual without us needing to parse or sandbox the script.
+ *
+ * Returns the bridge's status payload so callers can log when the
+ * pulse was dropped (app not running, no visible window, overlay
+ * disabled). Best-effort: any bridge failure is swallowed so a
+ * dead-helper case never blocks the actual apple_script call.
+ */
+export async function pulseAppWindow(args: {
+	app?: string;
+	bundleId?: string;
+	signal?: AbortSignal;
+}): Promise<{ triggered?: boolean; reason?: string; pid?: number } | undefined> {
+	try {
+		return await bridgeCommand<{ triggered?: boolean; reason?: string; pid?: number }>(
+			"pulseAppWindow",
+			{
+				app: args.app,
+				bundleId: args.bundleId,
+			},
+			{ signal: args.signal, timeoutMs: COMMAND_TIMEOUT_MS },
+		);
+	} catch {
+		return undefined;
+	}
+}
+
 export function stopBridge(): void {
 	rejectAllPending(new HelperTransportError("Computer-use helper stopped."));
 
