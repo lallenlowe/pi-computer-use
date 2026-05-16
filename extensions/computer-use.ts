@@ -19,6 +19,7 @@ import {
 	executeMoveMouse,
 	executeScroll,
 	executeSetText,
+	executeSelectText,
 	executeScreenshot,
 	executeTypeText,
 	executeWait,
@@ -37,6 +38,7 @@ import {
 	type MoveMouseParams,
 	type ScreenshotParams,
 	type ScrollParams,
+	type SelectTextParams,
 	type SetTextParams,
 	type TypeTextParams,
 	type WaitParams,
@@ -398,6 +400,38 @@ const setTextTool = defineTool(withCompactRendering({
 	}),
 	async execute(toolCallId, params: SetTextParams, signal, onUpdate, ctx) {
 		return await executeSetText(toolCallId, params, signal, onUpdate, ctx);
+	},
+}));
+
+const selectTextTool = defineTool(withCompactRendering({
+	name: "select_text",
+	label: "Select Text",
+	description: "Select (or place the cursor at) a literal substring inside an AX text element by content, not coordinates.",
+	promptSnippet: "Find a literal substring inside an AX text element and select it (or place the cursor before/after).",
+	promptGuidelines: [
+		"Use this instead of click+arrow-keys to position the cursor or select a range when the target text is visible in the AX tree.",
+		"`text` must match the element's AXValue character-for-character (case-sensitive, no normalisation).",
+		"If the same text appears multiple times in the element, supply `prefix` and/or `suffix` (the surrounding characters) to disambiguate.",
+		"`placement` defaults to 'selection'. Use 'before' to put the caret at the start of the match (e.g. before inserting), 'after' to put the caret at the end.",
+		"Only works on AX text elements (AXTextField, AXTextArea, etc) that expose their value as a string.",
+	],
+	executionMode: "sequential",
+	parameters: Type.Object({
+		ref: Type.String({ description: "AX text target ref from the latest screenshot, e.g. @e3" }),
+		text: Type.String({ description: "Literal substring to select inside the element's value" }),
+		prefix: Type.Optional(Type.String({ description: "Characters that must precede `text` to disambiguate when it appears multiple times" })),
+		suffix: Type.Optional(Type.String({ description: "Characters that must follow `text` to disambiguate when it appears multiple times" })),
+		placement: Type.Optional(Type.Union([
+			Type.Literal("selection"),
+			Type.Literal("before"),
+			Type.Literal("after"),
+		], { description: "'selection' (default) selects the range; 'before' places caret at start of match; 'after' places caret at end" })),
+		window: windowSelectorSchema,
+		stateId: stateIdSchema,
+		image: imageModeSchema,
+	}),
+	async execute(toolCallId, params: SelectTextParams, signal, onUpdate, ctx) {
+		return await executeSelectText(toolCallId, params, signal, onUpdate, ctx);
 	},
 }));
 
@@ -799,6 +833,7 @@ export default function computerUseExtension(pi: ExtensionAPI): void {
 		pi.registerTool(keypressTool);
 		pi.registerTool(typeTextTool);
 		pi.registerTool(setTextTool);
+		pi.registerTool(selectTextTool);
 		pi.registerTool(waitTool);
 		pi.registerTool(arrangeWindowTool);
 		pi.registerTool(computerActionsTool);

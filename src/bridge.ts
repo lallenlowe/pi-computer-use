@@ -146,6 +146,19 @@ export interface SetTextParams extends WindowTargetParams {
 	ref?: string;
 }
 
+export interface SelectTextParams extends WindowTargetParams {
+	/** AX target ref (e.g. "@e3") of the text element to select inside. */
+	ref: string;
+	/** Literal substring to select. */
+	text: string;
+	/** Optional surrounding text BEFORE `text` to disambiguate when `text` appears multiple times. */
+	prefix?: string;
+	/** Optional surrounding text AFTER `text` to disambiguate. */
+	suffix?: string;
+	/** "selection" (default) selects the range; "before" puts caret at start; "after" puts caret at end. */
+	placement?: "selection" | "before" | "after";
+}
+
 export interface KeypressParams extends WindowTargetParams {
 	keys: string[];
 }
@@ -250,6 +263,7 @@ interface ExecutionTrace {
 		| "ax_action"
 		| "browser_open_location"
 		| "ax_set_value"
+		| "ax_select_text"
 		| "raw_keypress"
 		| "per_pid_keypress"
 		| "raw_key_text";
@@ -3288,6 +3302,74 @@ async function performSetText(params: SetTextParams, signal?: AbortSignal): Prom
 	}
 }
 
+async function dispatchSelectText(params: SelectTextParams, target: ResolvedTarget, signal?: AbortSignal): Promise<ExecutionTrace> {
+	const ref = trimOrUndefined(params.ref);
+	if (!ref) {
+		throw new Error("select_text requires a ref to an AX text element (e.g. @e3 from the latest screenshot).");
+	}
+	const text = typeof params.text === "string" ? params.text : "";
+	if (!text) {
+		throw new Error("select_text requires a non-empty text string.");
+	}
+	const placement = params.placement ?? "selection";
+	if (placement !== "selection" && placement !== "before" && placement !== "after") {
+		throw new Error(`select_text placement must be 'selection', 'before', or 'after' (got ${JSON.stringify(placement)}).`);
+	}
+	let axTarget = axTargetByRef(ref);
+
+	const sendSelect = async (elementRef: string): Promise<void> => {
+		await bridgeCommand(
+			"axSelectText",
+			{
+				elementRef,
+				text,
+				prefix: params.prefix ?? "",
+				suffix: params.suffix ?? "",
+				placement,
+			},
+			{ signal, timeoutMs: COMMAND_TIMEOUT_MS },
+		);
+	};
+
+	try {
+		await sendSelect(axTarget.elementRef);
+	} catch (error) {
+		if (!isElementRefInvalid(error)) throw error;
+		const reacquired = await reacquireAxTarget(axTarget, target, signal);
+		if (!reacquired) throw error;
+		axTarget = reacquired;
+		await sendSelect(axTarget.elementRef);
+	}
+	return executionTrace("ax_select_text", { axAttempted: true, axSucceeded: true, fallbackUsed: false });
+}
+
+async function performSelectText(params: SelectTextParams, signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails>> {
+	runtimeState.currentImageMode = normalizeImageMode(params.image);
+	await selectWindowIfProvided(params.window, signal);
+	const currentTarget = await resolveCurrentTarget(signal);
+	let activation = emptyActivation();
+	let stateMayHaveChanged = false;
+
+	try {
+		const readyTarget = await ensureTargetWindowId(currentTarget, signal);
+		return await withWindowWriteLock(readyTarget, async () => {
+			const execution = await dispatchSelectText(params, readyTarget, signal);
+			stateMayHaveChanged = true;
+			await sleep(settleMsForExecution(execution), signal);
+			const captureResult = await captureCurrentTarget(signal, activation);
+			const placement = params.placement ?? "selection";
+			const verb = placement === "before" ? "Placed cursor before" : placement === "after" ? "Placed cursor after" : "Selected";
+			const summary = `${verb} text in ${captureResult.target.appName} — ${captureResult.target.windowTitle}. Returned the latest semantic window state.`;
+			return await buildToolResult("select_text", summary, captureResult, execution, signal);
+		});
+	} catch (error) {
+		if (stateMayHaveChanged) {
+			throw addRefreshHint(error);
+		}
+		throw normalizeError(error);
+	}
+}
+
 async function performKeypress(params: KeypressParams, signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails>> {
 	runtimeState.currentImageMode = normalizeImageMode(params.image);
 	await selectWindowIfProvided(params.window, signal);
@@ -3946,6 +4028,16 @@ export async function executeSetText(
 	ctx: ExtensionContext,
 ): Promise<AgentToolResult<ComputerUseDetails>> {
 	return await executeTool(ctx, signal, () => performSetText(params, signal));
+}
+
+export async function executeSelectText(
+	_toolCallId: string,
+	params: SelectTextParams,
+	signal: AbortSignal | undefined,
+	_onUpdate: AgentToolUpdateCallback<ComputerUseDetails> | undefined,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<ComputerUseDetails>> {
+	return await executeTool(ctx, signal, () => performSelectText(params, signal));
 }
 
 export async function executeArrangeWindow(

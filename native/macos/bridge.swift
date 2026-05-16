@@ -1591,6 +1591,8 @@ final class Bridge {
 			return try focusedElement(request)
 		case "setValue":
 			return try setValue(request)
+		case "axSelectText":
+			return try axSelectText(request)
 		case "typeText":
 			return try typeText(request)
 		case "getMousePosition":
@@ -3475,6 +3477,120 @@ final class Bridge {
 			"isTextInput": isTextInput,
 			"isSecure": secure,
 			"canSetValue": canSetValue,
+		]
+	}
+
+	/// Select (or place the cursor near) a literal substring inside an
+	/// AX text element. Schema:
+	///   elementRef: required
+	///   text:      required
+	///   prefix?:   surrounding text that must precede `text` to
+	///              disambiguate when the match is ambiguous
+	///   suffix?:   surrounding text that must follow `text` to
+	///              disambiguate
+	///   placement?: "selection" (default) selects the range;
+	///               "before" places caret at start of match;
+	///               "after"  places caret at end of match
+	///
+	/// Returns { selected: true, location, length } on success. Throws
+	/// when the element exposes no string AXValue, the match is not
+	/// found, the match is ambiguous and no prefix/suffix narrows it,
+	/// or the AXSelectedTextRange attribute isn't writable.
+	private func axSelectText(_ request: [String: Any]) throws -> [String: Any] {
+		let elementRef = try stringArg(request, "elementRef")
+		let text = try stringArg(request, "text")
+		let prefix = optionalStringArg(request, "prefix") ?? ""
+		let suffix = optionalStringArg(request, "suffix") ?? ""
+		let placement = (optionalStringArg(request, "placement") ?? "selection").lowercased()
+		guard placement == "selection" || placement == "before" || placement == "after" else {
+			throw BridgeFailure(message: "placement must be 'selection', 'before', or 'after'", code: "invalid_args")
+		}
+		if text.isEmpty {
+			throw BridgeFailure(message: "text must not be empty", code: "invalid_args")
+		}
+		guard let element = refStore.element(for: elementRef) else {
+			throw BridgeFailure(message: "Element reference is no longer valid", code: "element_ref_invalid")
+		}
+
+		// Read the element's string value. Must be a string AXValue.
+		var valueRef: AnyObject?
+		let readStatus = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef)
+		guard readStatus == .success else {
+			throw BridgeFailure(message: "Element has no readable AXValue (AX error \(readStatus.rawValue))", code: "value_unreadable")
+		}
+		guard let stringValue = valueRef as? String else {
+			throw BridgeFailure(message: "Element AXValue is not a string; select_text only works on text elements (AXTextField, AXTextArea, etc).", code: "value_not_string")
+		}
+
+		// Locate the match. Use UTF-16 offsets because AXSelectedTextRange
+		// is documented in UTF-16 code units (CFRange over the underlying
+		// CFString). NSString matching uses literal compare for exact
+		// substring semantics (no normalisation, no case folding).
+		let ns = stringValue as NSString
+		let needle = (prefix + text + suffix) as NSString
+		let searchRange = NSRange(location: 0, length: ns.length)
+		var matches: [NSRange] = []
+		var cursor = searchRange
+		while cursor.length > 0 {
+			let hit = ns.range(of: needle as String, options: .literal, range: cursor)
+			if hit.location == NSNotFound { break }
+			matches.append(hit)
+			let nextStart = hit.location + max(1, hit.length)
+			if nextStart >= ns.length { break }
+			cursor = NSRange(location: nextStart, length: ns.length - nextStart)
+		}
+		if matches.isEmpty {
+			let sample = ns.length > 80 ? (ns.substring(to: 80) + "…") : (stringValue)
+			let describe = prefix.isEmpty && suffix.isEmpty ? "text" : "prefix+text+suffix"
+			throw BridgeFailure(message: "\(describe) not found in element value (length \(ns.length)). Value starts: \(sample.debugDescription)", code: "text_not_found")
+		}
+		if matches.count > 1 {
+			throw BridgeFailure(message: "Match is ambiguous (\(matches.count) occurrences). Provide prefix and/or suffix to disambiguate.", code: "text_ambiguous")
+		}
+		let outerMatch = matches[0]
+		// Strip the prefix/suffix offsets to get the inner text range.
+		let innerLocation = outerMatch.location + (prefix as NSString).length
+		let innerLength = (text as NSString).length
+
+		let (selLocation, selLength): (Int, Int)
+		switch placement {
+		case "before":
+			selLocation = innerLocation
+			selLength = 0
+		case "after":
+			selLocation = innerLocation + innerLength
+			selLength = 0
+		default:
+			selLocation = innerLocation
+			selLength = innerLength
+		}
+
+		var cfRange = CFRange(location: selLocation, length: selLength)
+		guard let axRange = AXValueCreate(.cfRange, &cfRange) else {
+			throw BridgeFailure(message: "Failed to construct CFRange AXValue", code: "axvalue_failed")
+		}
+		let setStatus = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange)
+		if setStatus != .success {
+			throw BridgeFailure(message: "Failed to set AXSelectedTextRange (AX error \(setStatus.rawValue)). Element may not accept selection changes.", code: "select_failed")
+		}
+		// Best-effort: nudge the element to scroll the selection into
+		// view. Some text elements honour AXVisibleCharacterRange writes,
+		// others ignore it; we ignore the return status either way.
+		let visibleRange = CFRange(location: selLocation, length: max(selLength, 1))
+		var visibleMutable = visibleRange
+		if let visibleAxRange = AXValueCreate(.cfRange, &visibleMutable) {
+			AXUIElementSetAttributeValue(element, kAXVisibleCharacterRangeAttribute as CFString, visibleAxRange)
+		}
+		// Visual: outline the field to confirm something happened.
+		var elementPid: pid_t = 0
+		_ = AXUIElementGetPid(element, &elementPid)
+		OverlayController.shared.triggerTypeFlash(globalRect: frameForElement(element), ownerPid: elementPid > 0 ? elementPid : nil)
+
+		return [
+			"selected": true,
+			"location": selLocation,
+			"length": selLength,
+			"placement": placement,
 		]
 	}
 
