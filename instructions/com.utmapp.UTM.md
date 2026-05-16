@@ -36,10 +36,6 @@ GNOME AT-SPI / Windows UIA are invisible to macOS. The `@eN` targets you see are
 - **Standalone modifier-only events (Super, Cmd alone) don't propagate through UTM** — UTM-side filter. Use UTM's `View → Send Key`, or remap the guest shortcut to a chord (Ctrl+Alt+X).
 - For guest text input, prefer `apple_script` `keystroke "..."` over per-character `type_text` — more reliable when Capture Input is flapping.
 
-## Don't drive OS installers via this skill
-
-Anaconda, Ubuntu Server installer, Windows Setup live entirely in the guest framebuffer — no AX, no DOM, every click is dead-reckoning. **Use kickstart / preseed / unattend.xml** to skip the GUI. If you must drive the installer: don't try to recover from a wrong click (restart the VM), and switch to SSH the moment the install completes.
-
 ## Ask before
 
 - VM transport (Start, Stop, Pause, Restart) — Stop is a power-cut.
