@@ -1254,7 +1254,16 @@ async function startBridgeProcess(): Promise<ChildProcessWithoutNullStreams> {
 			runtimeState.overlayOcclusionAware = undefined;
 		}
 		const reason = sig ? `signal ${sig}` : `exit code ${code ?? "unknown"}`;
-		rejectAllPending(new HelperTransportError(`Computer-use helper exited (${reason}).`));
+		// SIGTERM almost always means the extension itself sent it via
+		// stopBridge() after a command timed out (most often a wedged
+		// SCK screenshot under window-server contention). The next
+		// command spawns a fresh helper automatically, so the user just
+		// needs to retry. Surface that explicitly so 'helper exited'
+		// doesn't read as a permanent failure.
+		const hint = sig === "SIGTERM"
+			? " The previous command timed out and the helper was restarted; retry the same command - the next call spawns a fresh helper automatically."
+			: "";
+		rejectAllPending(new HelperTransportError(`Computer-use helper exited (${reason}).${hint}`));
 	});
 
 	runtimeState.helper = child;
