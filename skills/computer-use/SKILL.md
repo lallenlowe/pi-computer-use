@@ -13,6 +13,8 @@ Use these tools when shell/file tools are not enough and you need to operate a m
 
 Real coordinate clicks, real keypresses, real text input — all delivered via per-PID `CGEventPostToPid`, which lands the event in the target app's queue without changing the user's frontmost or moving the system cursor. This is the only mode; there is no separate "stealth" toggle.
 
+**Auto-upgrade**: when the target app is already frontmost, input auto-upgrades to HID-tap delivery — the same path a real mouse/trackpad uses. This unlocks apps that grab HID-level input (VMs like UTM/Parallels, games, anything subscribed to a `CGEventTap`, some web compositors). You don't toggle this; it just happens when frontmost == target.
+
 The two tools that change frontmost are gated by `requireFocusChangeApproval` — they call `ctx.ui.confirm(…)` before activating, surfacing the `reason` you pass:
 
 - **`surface_window({ windowRef, reason })`** — activates the app and raises the window. Switches the user's viewport to the window's Space (or moves the window to active, depending on Spaces settings). Always pass a clear `reason` so the user understands the prompt.
@@ -28,11 +30,9 @@ Everything else — `click`, `double_click`, `type_text`, `set_text`, `keypress`
 2. If the latest screenshot includes AX target refs, use those first for `click` / `set_text`. Refs are more reliable than coordinates and don't require visual grounding.
 3. To discover/switch apps or windows, use `list_apps`, `list_windows`, then `screenshot({ window: "@w1" })` or pass `window` to action tools.
 4. To launch an app that isn't running, use `launch_app({ bundleId })` (or `appName`). Default is background launch; the returned pid is immediately usable with `screenshot({ pid })`.
-5. For text input, prefer `set_text({ ref: "@eN", text })` when the screenshot exposes a matching AX text target. Use click + `type_text({ text })` for fields without AX values (Electron webview content is the common case).
-6. Use `keypress({ keys })` for Enter, Tab, Escape, arrows, deletion, and shortcuts. Enter/Escape/Space try semantic AX actions first; everything else delivers via per-PID `CGEventPostToPid`.
-7. For browser navigation, use `keypress(["Command+L"])` → `set_text(URL)` → `keypress(["Enter"])`. Batched via `computer_actions` when no intermediate screenshot is needed.
-8. Use `computer_actions({ actions })` to batch obvious actions like click + type + Enter when no intermediate screenshot is needed.
-9. Every successful action returns the **latest semantic state**. If AX targets are missing, sparse, or ambiguous, an image is attached for vision fallback.
+5. For text input, prefer `set_text({ ref: "@eN", text })` when the screenshot exposes a matching AX text target; fall back to click + `type_text({ text })` (Electron webview content is the common case).
+6. Use `computer_actions({ actions })` to batch obvious sequences (click + type + Enter, Cmd+L + URL + Enter) when no intermediate screenshot is needed.
+7. Every successful action returns the **latest semantic state**. If AX targets are missing, sparse, or ambiguous, an image is attached for vision fallback.
 
 ## Practical rules
 
@@ -46,12 +46,9 @@ Everything else — `click`, `double_click`, `type_text`, `set_text`, `keypress`
 - For shortcut sequences, use chord strings like `keypress({ keys: ["Command+L", "Enter"] })`; reserve `["Command", "L"]` for a single chord call.
 - `computer_actions` executes one to twenty actions and returns one state update plus per-action execution metadata. Do not batch if the next action depends on seeing an intermediate result.
 - `wait({ ms })` pauses and then returns the latest semantic state for polling/loading states.
-- Accessibility permission is mandatory for actions.
-- Screen Recording permission is mandatory for screenshots and model vision context.
-- Public tool surface is `list_apps`, `list_windows`, `screenshot`, `click`, `double_click`, `move_mouse`, `drag`, `scroll`, `keypress`, `type_text`, `set_text`, `wait`, `arrange_window`, `computer_actions`, `apple_script`, `wake_window`, `surface_window`, `launch_app`.
-- Run `/computer-use` to show effective config. Config files are `~/.pi/agent/extensions/pi-computer-use.json` globally and `.pi/computer-use.json` per project.
-- `browser_use=false` blocks control of known browser apps. `focus_auto_approve=true` makes the focus-change tools skip their `ctx.ui.confirm` prompt.
-- If a `screenshot` result includes an `--- App-specific instructions for ... ---` block, prefer the guidance there over generic heuristics for that app. The instructions are hand-written for surprising behaviors (selection rules, modifier conventions, irreversible actions) the AX tree alone won't tell you about. Apps without instructions are normal — work it out from AX targets and the screenshot as usual.
+- Accessibility + Screen Recording permissions are mandatory.
+- The `[contract: ...]` marker at the top of `screenshot`, `list_apps`, and `list_windows` responses tells you what's currently in play (focus auto-approve state, browser-use allowance, apple_script availability).
+- If a `screenshot` result includes an `--- App-specific instructions for ... ---` block, prefer the guidance there over generic heuristics for that app. The instructions are hand-written for surprising behaviors (selection rules, modifier conventions, irreversible actions) the AX tree alone won't tell you about.
 
 ## When errors happen
 
@@ -82,10 +79,10 @@ If `list_apps` still lists the app but `list_windows` returns nothing, the app h
 
 ### Recovery loop: app doesn't respond to per-PID input
 
-Modern apps accept per-PID input regardless of foreground. If you've sent clicks/keys to a non-foreground window and nothing happened:
+Most apps accept per-PID input regardless of foreground. **Three categories don't:**
 
-1. Confirm the input was actually delivered: tool result shows successful execution, no error.
-2. Check whether the app needs foreground for *that specific operation*. Modal dialogs and some Electron settings panes only render when foreground.
-3. Call `surface_window({ windowRef: "@wN", reason: "..." })`. Once foreground, retry the operation.
+- **HID-grabbing apps** — VMs (UTM/Parallels/VMware), games, anything subscribed to a `CGEventTap`, some web compositors. They only respond to events delivered through the system HID pipeline.
+- **Modal dialogs / some Electron settings panes** — only render when foreground.
+- **Legacy AppKit apps** — occasionally drop per-PID input.
 
-The `[contract: …]` marker at the top of `screenshot`, `list_apps`, and `list_windows` responses tells you what's currently in play, including the current `focus_auto_approve` state.
+For all three: call `surface_window({ windowRef: "@wN", reason: "..." })`. Once the target is frontmost, input auto-upgrades to HID-tap delivery and the app responds like a real mouse/keyboard delivered the event. Retry the operation.
