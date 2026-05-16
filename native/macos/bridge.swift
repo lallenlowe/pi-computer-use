@@ -732,7 +732,7 @@ final class OverlayController {
 	// (scroll chevrons, keypress badge, window pulse, type flash,
 	// click ring) resets the idle clock - the cursor stays put
 	// while the agent is still doing stuff.
-	var cursorIdleFadeStart: CFTimeInterval = 10.0
+	var cursorIdleFadeStart: CFTimeInterval = 20.0
 	var cursorIdleFadeDuration: CFTimeInterval = 0.5
 
 	// Timestamp of the most recent agent activity. nil means we have
