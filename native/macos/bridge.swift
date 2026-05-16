@@ -1023,7 +1023,16 @@ final class OverlayController {
 				view.typeFlashes = []
 				view.keypressBadges = []
 				view.scrollEffects = []
-				view.windowPulses = []
+				// Window pulses bypass the cursor-occlusion check:
+				// they fire on an explicit window frame (raise / launch /
+				// arrange / apple_script-against-app), so the visual
+				// honestly represents "agent acted on this window" even
+				// when that window is partly or fully occluded by
+				// another app. The pulse itself is the localized cue.
+				view.windowPulses = windowPulses.map { pulse in
+					let rect = convertGlobalRectToScreenLocal(pulse.globalFrame, screen: screen)
+					return ScreenLocalWindowPulse(localRect: rect, age: now - pulse.startTime)
+				}
 				view.needsDisplay = true
 				continue
 			}
@@ -1105,7 +1114,13 @@ final class OverlayController {
 				view.typeFlashes = []
 				view.keypressBadges = []
 				view.scrollEffects = []
-				view.windowPulses = []
+				// See note in renderGlobalPoint: window pulses honestly
+				// announce frame-level agent actions and bypass the
+				// cursor-occlusion check.
+				view.windowPulses = windowPulses.map { pulse in
+					let rect = convertGlobalRectToScreenLocal(pulse.globalFrame, screen: screen)
+					return ScreenLocalWindowPulse(localRect: rect, age: now - pulse.startTime)
+				}
 				view.needsDisplay = true
 				continue
 			}
@@ -1406,6 +1421,8 @@ final class Bridge {
 			return try surfaceWindow(request)
 		case "launchApp":
 			return try launchApp(request)
+		case "pulseAppWindow":
+			return try pulseAppWindow(request)
 		case "getFrontmost":
 			return try getFrontmost()
 		case "getUserContext":
@@ -2160,6 +2177,58 @@ final class Bridge {
 		}
 		let frame = frameForWindow(windows[0])
 		return (frame.width > 0 && frame.height > 0) ? frame : nil
+	}
+
+	/// Slice 22: resolve an app (by `app` display name or `bundleId`)
+	/// and fire the amber window pulse around its primary window's
+	/// frame so an `apple_script` invocation against that app ties
+	/// visibly to the agent's intent. AppleScript runs entirely in
+	/// the host pi process via `osascript` and the bridge has no idea
+	/// what it's doing internally; this gives the user a "hey, an
+	/// AppleScript ran against this app" visual without us needing
+	/// to parse or sandbox the script.
+	///
+	/// Returns a status payload so the TS caller can log whether the
+	/// pulse actually fired (app not running, no AX-visible window,
+	/// or pulse dropped for zero-area frame all return
+	/// `triggered: false` with a reason).
+	private func pulseAppWindow(_ request: [String: Any]) throws -> [String: Any] {
+		let bundleId = optionalStringArg(request, "bundleId")
+		let appName = optionalStringArg(request, "app")
+
+		var running: NSRunningApplication? = nil
+		if let bundleId, !bundleId.isEmpty {
+			running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first
+		}
+		if running == nil, let appName, !appName.isEmpty {
+			let lower = appName.lowercased()
+			running = NSWorkspace.shared.runningApplications.first { app in
+				guard let localized = app.localizedName?.lowercased() else { return false }
+				return localized == lower
+			}
+		}
+		guard let running else {
+			return ["triggered": false, "reason": "app_not_running"]
+		}
+
+		guard let frame = primaryWindowFrame(forPid: running.processIdentifier) else {
+			// Common cases: agent ran an AppleScript against an app with
+			// no visible window (background daemon, just-launched app,
+			// menu-bar-only utility). Honest no-op — we don't paint a
+			// cue for an invisible target.
+			return [
+				"triggered": false,
+				"reason": "no_visible_window",
+				"pid": Int(running.processIdentifier),
+			]
+		}
+
+		OverlayController.shared.triggerWindowPulse(globalFrame: frame, ownerPid: running.processIdentifier)
+		return [
+			"triggered": OverlayController.shared.isEnabled(),
+			"pid": Int(running.processIdentifier),
+			"framePoints": ["x": frame.origin.x, "y": frame.origin.y, "w": frame.width, "h": frame.height],
+		]
 	}
 
 	/// Shared resolver for wakeWindow / surfaceWindow. Returns the

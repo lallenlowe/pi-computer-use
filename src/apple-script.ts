@@ -30,6 +30,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+import { pulseAppWindow } from "./bridge.ts";
 import { getAppleScriptConfig, getComputerUseConfig } from "./config.ts";
 
 const execFileAsync = promisify(execFile);
@@ -190,6 +191,21 @@ export async function performAppleScript(
 	const timeoutMs = Math.min(requestedTimeout, 60_000);
 
 	const frontmostBefore = await readFrontmost(2000, signal);
+
+	// Slice 22: amber pulse around the target app's primary window
+	// so the user has a visible "AppleScript ran against this app"
+	// cue tied to the agent's intent. Fired BEFORE the script runs
+	// so the pulse is visible while the script does its thing.
+	// Only attempted when `app:` is set — a bare `osascript` doing
+	// general system stuff has no obvious target to highlight. Pulse
+	// is best-effort and never blocks the script (bridge helper
+	// failures swallow silently inside pulseAppWindow).
+	const targetApp =
+		typeof params.app === "string" && params.app.trim().length > 0 ? params.app.trim() : undefined;
+	if (targetApp) {
+		await pulseAppWindow({ app: targetApp, signal });
+	}
+
 	const start = Date.now();
 	const result = await runAppleScript(script, timeoutMs, signal);
 	const durationMs = Date.now() - start;
