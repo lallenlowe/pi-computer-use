@@ -89,7 +89,9 @@ struct ClickRingEffect {
 	let globalPoint: CGPoint
 	let button: CursorEffectButton
 	let startTime: CFTimeInterval
-	static let duration: CFTimeInterval = 0.350
+	// Bumped from 0.350 → 0.550 so a single click is easier to catch
+	// visually when the user isn't already looking at the cursor.
+	static let duration: CFTimeInterval = 0.550
 
 	func isFinished(at now: CFTimeInterval) -> Bool {
 		return now - startTime >= ClickRingEffect.duration
@@ -105,7 +107,10 @@ struct TypeFlashEffect {
 	let globalRect: CGRect?
 	let fallbackCursorPoint: CGPoint?
 	let startTime: CFTimeInterval
-	static let duration: CFTimeInterval = 0.650
+	// Bumped from 0.650 → 0.950. Hold + fade envelope rebalanced in
+	// drawTypeFlashes so the extra time lands mostly in the hold,
+	// keeping the flash feeling stable rather than lingering.
+	static let duration: CFTimeInterval = 0.950
 
 	func isFinished(at now: CFTimeInterval) -> Bool {
 		return now - startTime >= TypeFlashEffect.duration
@@ -121,7 +126,11 @@ struct KeypressBadgeEffect {
 	let globalPoint: CGPoint
 	let label: String
 	let startTime: CFTimeInterval
-	static let duration: CFTimeInterval = 0.700
+	// Bumped from 0.700 → 1.100. Envelope in drawKeypressBadges keeps
+	// the 80ms fade-in and rebalances the rest as 720ms hold +
+	// 300ms fade-out so chord labels stay readable longer without
+	// the fade feeling stretched.
+	static let duration: CFTimeInterval = 1.100
 
 	func isFinished(at now: CFTimeInterval) -> Bool {
 		return now - startTime >= KeypressBadgeEffect.duration
@@ -149,7 +158,10 @@ struct ScrollEffect {
 	/// Number of chevrons to stamp (1–3). Driven by scroll magnitude.
 	let chevronCount: Int
 	let startTime: CFTimeInterval
-	static let duration: CFTimeInterval = 0.420
+	// Bumped from 0.420 → 0.700. Chevrons travel outward over the
+	// full lifetime; the longer window gives stacked chevrons more
+	// time to fan out before the trailing ones start fading.
+	static let duration: CFTimeInterval = 0.700
 
 	func isFinished(at now: CFTimeInterval) -> Bool {
 		return now - startTime >= ScrollEffect.duration
@@ -168,7 +180,12 @@ struct WindowPulseEffect {
 	let id: UUID
 	let globalFrame: CGRect
 	let startTime: CFTimeInterval
-	static let duration: CFTimeInterval = 0.900
+	// Bumped from 0.900 → 1.400. Window pulses fire across Spaces
+	// transitions and app-activation flashes — the user's eye has
+	// to chase several things at once, so the cue needs more time
+	// to register. Envelope rebalanced in drawWindowPulses to keep
+	// the hold prominent and only stretch the fade slightly.
+	static let duration: CFTimeInterval = 1.400
 
 	func isFinished(at now: CFTimeInterval) -> Bool {
 		return now - startTime >= WindowPulseEffect.duration
@@ -337,21 +354,20 @@ final class OverlayCursorView: NSView {
 	}
 
 	/// Render every currently-active type flash as a 2pt rounded
-	/// rectangle outline whose alpha follows a 100ms-in / 250ms-hold /
-	/// 300ms-out envelope.
+	/// rectangle outline. Envelope (at 0.950s lifetime): ~95ms fade
+	/// in / ~620ms hold / ~235ms fade out — rebalanced from the
+	/// shorter 0.650s timing so the hold reads stable rather than
+	/// the fade feeling stretched.
 	private func drawTypeFlashes(_ ctx: CGContext) {
 		for flash in typeFlashes {
 			let t = max(0.0, min(1.0, flash.age / TypeFlashEffect.duration))
-			// Envelope: fade in over first ~15%, hold to 55%, fade out
-			// over the final 45%. Numbers chosen so the user gets a clear
-			// "thing happened here" impression without it lingering.
 			let alpha: CGFloat
-			if t < 0.15 {
-				alpha = CGFloat(t / 0.15)
-			} else if t < 0.55 {
+			if t < 0.10 {
+				alpha = CGFloat(t / 0.10)
+			} else if t < 0.75 {
 				alpha = 1.0
 			} else {
-				alpha = CGFloat((1.0 - t) / 0.45)
+				alpha = CGFloat((1.0 - t) / 0.25)
 			}
 			if alpha <= 0 { continue }
 			let path = NSBezierPath(roundedRect: flash.localRect, xRadius: 4, yRadius: 4)
@@ -434,12 +450,13 @@ final class OverlayCursorView: NSView {
 	private func drawKeypressBadges(_ ctx: CGContext) {
 		for badge in keypressBadges {
 			let t = max(0.0, min(1.0, badge.age / KeypressBadgeEffect.duration))
-			// Envelope: 80ms in / 420ms hold / 200ms out. Slightly
-			// hold-heavier than type-flash since chord text takes a
-			// beat to read.
+			// Envelope: 80ms in / 720ms hold / 300ms out. Hold-heavier
+			// than type-flash since chord text takes a beat to read; the
+			// extra duration vs the earlier 80/420/200 envelope all
+			// lands in the hold + a small fade bump.
 			let alpha: CGFloat
 			let fadeIn = 0.080 / KeypressBadgeEffect.duration
-			let holdEnd = (0.080 + 0.420) / KeypressBadgeEffect.duration
+			let holdEnd = (0.080 + 0.720) / KeypressBadgeEffect.duration
 			if t < fadeIn {
 				alpha = CGFloat(t / fadeIn)
 			} else if t < holdEnd {
@@ -501,15 +518,15 @@ final class OverlayCursorView: NSView {
 			let t = max(0.0, min(1.0, pulse.age / WindowPulseEffect.duration))
 			let eased = OverlayController.easeOutCubic(t)
 
-			// Two-pulse envelope: full alpha for the first 25%, fade
-			// out across the remaining 75%. Long enough to register
-			// across a Spaces transition / app-activation flash but
-			// short enough not to feel like decoration.
+			// Two-pulse envelope (at 1.400s lifetime): 40% hold then
+			// 60% fade-out. Hold prominent so the cue survives Spaces
+			// transitions and app-activation flashes; long enough fade
+			// to register without overstaying the moment of action.
 			let alpha: CGFloat
-			if t < 0.25 {
+			if t < 0.40 {
 				alpha = 1.0
 			} else {
-				alpha = CGFloat((1.0 - t) / 0.75)
+				alpha = CGFloat((1.0 - t) / 0.60)
 			}
 			if alpha <= 0 { continue }
 
