@@ -3871,33 +3871,56 @@ final class Bridge {
 	private static let jpegQuality: Double = 0.75
 
 	private func screenshotPayload(image: CGImage, windowId: UInt32) throws -> [String: Any] {
-		let downscaled = downscaleIfNeeded(image)
+		// Look up window size BEFORE downscaling so we can normalize the
+		// returned image to logical-point resolution. Without windowSize
+		// (rare — window vanished between capture and lookup) we fall
+		// back to the legacy retina-sized image and the agent does math.
+		let windowSize: CGSize? = currentWindowBounds(windowId: windowId)?.size
 
-		// Look up window size BEFORE encoding so we can both (a) compute
-		// scaleFactor and (b) overlay logical-pt ruler ticks on the image
-		// for the agent. Without windowSize we fall back to the screen
-		// scale and skip the ruler (rather than draw misleading ticks).
-		var scale: Double = Double(NSScreen.main?.backingScaleFactor ?? 1.0)
-		var windowSize: CGSize? = nil
-		if let bounds = currentWindowBounds(windowId: windowId), bounds.size.height > 0 {
-			let derived = Double(downscaled.height) / Double(bounds.size.height)
-			if derived > 0.1 { scale = derived }
-			windowSize = bounds.size
-		}
-
-		// Draw logical-point ruler ticks at the top + left edges. Lets the
-		// agent read coordinates VISUALLY off the image without doing two
-		// scale conversions (displayed-image -> native-image -> logical-pt)
-		// in its head. The major-tick labels are the exact value to pass
-		// to click({x,y}) — no math required.
-		let annotated: CGImage
-		if let windowSize, let withRuler = drawRulerOverlay(image: downscaled, windowSize: windowSize) {
-			annotated = withRuler
+		// Normalize the captured image to logical-point resolution so
+		// 1 image pixel == 1 window logical point. The agent reads pixel
+		// coords off the image and passes them as-is to click({x,y}).
+		// This is the simpler primitive Codex Computer Use uses (their
+		// internal flag is should_normalize_screenshot_to_point_resolution);
+		// having two coordinate systems with a mandatory division between
+		// them was the source of repeated 'off by N pt' click misses in
+		// our extension. With this change there is one coord system.
+		//
+		// Edge case: if window logical size exceeds the per-edge cap
+		// (maxImageEdgePixels = 2576), we can't fit the image at 1:1.
+		// In that case we keep the cap and scale falls below 1; envelope
+		// text reports the actual scale and the agent divides. Rare for
+		// normal app windows on typical retina displays.
+		let normalized: CGImage
+		if let windowSize, windowSize.width > 0, windowSize.height > 0 {
+			let targetW = Int(windowSize.width.rounded())
+			let targetH = Int(windowSize.height.rounded())
+			let capped = min(max(targetW, targetH), Self.maxImageEdgePixels)
+			let longest = max(targetW, targetH)
+			if longest > 0 && capped < longest {
+				// Window too big for the cap; fall back to capped retina
+				// downscale (preserving aspect ratio). scaleFactor will be
+				// reported correctly below.
+				normalized = downscaleIfNeeded(image)
+			} else {
+				normalized = resizeImage(image, toWidth: targetW, height: targetH) ?? downscaleIfNeeded(image)
+			}
 		} else {
-			annotated = downscaled
+			normalized = downscaleIfNeeded(image)
 		}
 
-		let rep = NSBitmapImageRep(cgImage: annotated)
+		// Derive the final scale from the actual normalized image vs the
+		// window. For the normalized path this should be ~1.0. For the
+		// fallback (window > cap, or windowSize lookup failed) it reflects
+		// reality (e.g. 0.85 if we hit the cap, or screen backing scale
+		// if windowSize is missing).
+		var scale: Double = Double(NSScreen.main?.backingScaleFactor ?? 1.0)
+		if let windowSize, windowSize.height > 0 {
+			let derived = Double(normalized.height) / Double(windowSize.height)
+			if derived > 0.05 { scale = derived }
+		}
+
+		let rep = NSBitmapImageRep(cgImage: normalized)
 		guard let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: NSNumber(value: Self.jpegQuality)]) else {
 			throw BridgeFailure(message: "Failed to encode screenshot as JPEG", code: "encoding_failed")
 		}
@@ -3910,8 +3933,8 @@ final class Bridge {
 			// falls back to image/png for older helper builds.
 			"pngBase64": jpegData.base64EncodedString(),
 			"imageMimeType": "image/jpeg",
-			"width": annotated.width,
-			"height": annotated.height,
+			"width": normalized.width,
+			"height": normalized.height,
 			"scaleFactor": scale,
 		]
 		if let windowSize {
@@ -3921,160 +3944,26 @@ final class Bridge {
 		return payload
 	}
 
-	/// Draw logical-point ruler ticks across the top + down the left of
-	/// the image. Major ticks every 50 logical pts (labeled with the
-	/// logical-pt value); minor ticks every 25 (unlabeled). Tick image-px
-	/// position is `logical_pt * (image_dim / window_dim)` — the same
-	/// scale the click coord contract uses, so a label reads as the exact
-	/// number to pass to `click({x, y})`.
-	///
-	/// The ruler bars are drawn OVER the existing image content at the
-	/// edges (no canvas growth), with a translucent dark backing strip
-	/// for legibility. Bar height/width is fixed in image pixels (~22 at
-	/// retina), so it covers ~10-15 logical pts of content at the edge.
-	/// That's a deliberate tradeoff vs the alternative (growing the
-	/// canvas, which would invalidate every existing image-px coord
-	/// mental model the agent has built up).
-	private func drawRulerOverlay(image: CGImage, windowSize: CGSize) -> CGImage? {
-		guard windowSize.width > 0, windowSize.height > 0 else { return nil }
-		let width = image.width
-		let height = image.height
-		guard width > 80, height > 80 else { return nil }
+	/// Resize a CGImage to an exact target pixel size. Used by
+	/// screenshotPayload to normalize captures to logical-point
+	/// resolution. Returns nil on failure; callers fall back to
+	/// downscaleIfNeeded (which preserves aspect and only shrinks past
+	/// the per-edge cap).
+	private func resizeImage(_ image: CGImage, toWidth newWidth: Int, height newHeight: Int) -> CGImage? {
+		guard newWidth > 0, newHeight > 0 else { return nil }
 		guard let colorSpace = image.colorSpace else { return nil }
 		guard let ctx = CGContext(
 			data: nil,
-			width: width,
-			height: height,
+			width: newWidth,
+			height: newHeight,
 			bitsPerComponent: 8,
 			bytesPerRow: 0,
 			space: colorSpace,
 			bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
 		) else { return nil }
-
-		// Source image first.
 		ctx.interpolationQuality = .high
-		ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-		// Ruler bar dimensions in image px.
-		let barThickness: CGFloat = 22
-		let majorTickLen: CGFloat = 12
-		let minorTickLen: CGFloat = 6
-		// Translucent dark backing strip so labels read against any
-		// underlying content.
-		ctx.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.55))
-		// Top strip.
-		ctx.fill(CGRect(x: 0, y: CGFloat(height) - barThickness, width: CGFloat(width), height: barThickness))
-		// Left strip.
-		ctx.fill(CGRect(x: 0, y: 0, width: barThickness, height: CGFloat(height) - barThickness))
-
-		// CG draws Y-up. The image was drawn into the context at origin (0,0)
-		// which means image row 0 (the visual TOP) ends up at high y in
-		// CG space. Place the X-axis ruler at the top of the image (high y)
-		// and the Y-axis ruler at the left (low x).
-		let xPxPerLogical = CGFloat(width) / windowSize.width
-		let yPxPerLogical = CGFloat(height) / windowSize.height
-
-		ctx.setStrokeColor(CGColor(srgbRed: 0.95, green: 0.95, blue: 0.95, alpha: 0.95))
-		ctx.setLineWidth(1.0)
-
-		// X axis ticks (top strip). Iterate logical pts.
-		let maxLogicalX = Int(windowSize.width.rounded(.down))
-		var tickX = 0
-		while tickX <= maxLogicalX {
-			let imgX = CGFloat(tickX) * xPxPerLogical
-			let isMajor = (tickX % 50 == 0)
-			let len = isMajor ? majorTickLen : minorTickLen
-			if tickX % 25 == 0 {
-				ctx.move(to: CGPoint(x: imgX, y: CGFloat(height)))
-				ctx.addLine(to: CGPoint(x: imgX, y: CGFloat(height) - len))
-				ctx.strokePath()
-			}
-			if isMajor && tickX > 0 {
-				drawRulerLabel(
-					context: ctx,
-					text: "\(tickX)",
-					centerX: imgX,
-					centerY: CGFloat(height) - barThickness / 2 - 4,
-					colorSpace: colorSpace
-				)
-			}
-			tickX += 25
-		}
-
-		// Y axis ticks (left strip). Iterate logical pts; remember CG y-up.
-		let maxLogicalY = Int(windowSize.height.rounded(.down))
-		var tickY = 0
-		while tickY <= maxLogicalY {
-			// Logical y is measured from the visual TOP. CG image y is
-			// measured from the bottom of the image-as-rendered. Convert.
-			let imgYFromTop = CGFloat(tickY) * yPxPerLogical
-			let imgYCG = CGFloat(height) - imgYFromTop
-			let isMajor = (tickY % 50 == 0)
-			let len = isMajor ? majorTickLen : minorTickLen
-			if tickY % 25 == 0 {
-				ctx.move(to: CGPoint(x: 0, y: imgYCG))
-				ctx.addLine(to: CGPoint(x: len, y: imgYCG))
-				ctx.strokePath()
-			}
-			if isMajor && tickY > 0 {
-				drawRulerLabel(
-					context: ctx,
-					text: "\(tickY)",
-					centerX: barThickness / 2,
-					centerY: imgYCG,
-					colorSpace: colorSpace
-				)
-			}
-			tickY += 25
-		}
-
+		ctx.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
 		return ctx.makeImage()
-	}
-
-	private func drawRulerLabel(
-		context: CGContext,
-		text: String,
-		centerX: CGFloat,
-		centerY: CGFloat,
-		colorSpace: CGColorSpace
-	) {
-		// Render text by rasterising into a small NSImage and drawing
-		// THAT into the context as a CGImage. This sidesteps every
-		// CT/Cocoa text-matrix flip surprise: image draws are always
-		// straightforward CG-space rectangles. The rasteriser uses
-		// NSAttributedString's normal Cocoa drawing path so colors and
-		// fonts work without ceremony.
-		let font = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
-		let attrs: [NSAttributedString.Key: Any] = [
-			.font: font,
-			.foregroundColor: NSColor(srgbRed: 0.95, green: 0.95, blue: 0.95, alpha: 1.0),
-		]
-		let attributed = NSAttributedString(string: text, attributes: attrs)
-		let textSize = attributed.size()
-		let labelWidth = max(1, Int(textSize.width.rounded(.up)))
-		let labelHeight = max(1, Int(textSize.height.rounded(.up)))
-		guard let textCtx = CGContext(
-			data: nil,
-			width: labelWidth,
-			height: labelHeight,
-			bitsPerComponent: 8,
-			bytesPerRow: 0,
-			space: colorSpace,
-			bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-		) else { return }
-		let nsCtx = NSGraphicsContext(cgContext: textCtx, flipped: false)
-		NSGraphicsContext.saveGraphicsState()
-		NSGraphicsContext.current = nsCtx
-		attributed.draw(at: NSPoint(x: 0, y: 0))
-		NSGraphicsContext.restoreGraphicsState()
-		guard let labelImage = textCtx.makeImage() else { return }
-		let drawRect = CGRect(
-			x: centerX - CGFloat(labelWidth) / 2,
-			y: centerY - CGFloat(labelHeight) / 2,
-			width: CGFloat(labelWidth),
-			height: CGFloat(labelHeight)
-		)
-		context.draw(labelImage, in: drawRect)
 	}
 
 	private func downscaleIfNeeded(_ image: CGImage) -> CGImage {

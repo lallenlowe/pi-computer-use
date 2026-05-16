@@ -284,11 +284,11 @@ export interface ComputerUseDetails {
 	};
 	capture: {
 		stateId: string;
-		/** Image pixel width (typically `windowWidth × scaleFactor`). */
+		/** Image pixel width. With normalization (default) equals windowWidth. */
 		width: number;
-		/** Image pixel height. */
+		/** Image pixel height. With normalization equals windowHeight. */
 		height: number;
-		/** image / window scale (typically 2.0 on retina). */
+		/** image / window scale. ~1.0 with normalization; <1 if window > max edge cap. */
 		scaleFactor: number;
 		timestamp: number;
 		/** Window logical-point width - the input space for click/move/drag/scroll. */
@@ -882,11 +882,11 @@ function ensurePointIsInCapture(
 	const h = capture.windowHeight;
 	if (x < 0 || y < 0 || x > w || y > h) {
 		const scale = capture.scaleFactor || 1;
-		const hint = scale > 1.05
-			? ` Image pixels (${capture.width}x${capture.height}) are ~${scale.toFixed(1)}x logical points; if you read this coordinate from the image, divide by ${scale.toFixed(1)} (image pixel \u2192 logical point).`
+		const hint = Math.abs(scale - 1) > 0.05
+			? ` This screenshot was not normalized 1:1 (image ${capture.width}x${capture.height}, scale ${scale.toFixed(2)}); divide image-pixel measurements by ${scale.toFixed(2)} to get window logical points.`
 			: "";
 		throw new Error(
-			`${errorPrefix} (${Math.round(x)},${Math.round(y)}) are outside the window frame (${Math.round(w)}x${Math.round(h)} logical points). Coordinates are window-relative LOGICAL POINTS, not image pixels.${hint} If the window was resized or moved since the last screenshot, call screenshot again and retry.`,
+			`${errorPrefix} (${Math.round(x)},${Math.round(y)}) are outside the window frame (${Math.round(w)}x${Math.round(h)} logical points).${hint} If the window was resized or moved since the last screenshot, call screenshot again and retry.`,
 		);
 	}
 }
@@ -1564,6 +1564,27 @@ function formatModeMarker(): string {
 	bits.push(`apple_script: ${config.apple_script.enabled ? "enabled" : "disabled"}`);
 	bits.push(`browser_use: ${config.browser_use ? "allowed" : "blocked"}`);
 	return bits.join(" \u00b7 ");
+}
+
+/// Render the coordinate-units line shown on every screenshot result.
+/// With image normalization (the default), `scaleFactor` is ~1.0 and
+/// the agent can use pixel coords directly. When window logical size
+/// exceeds the max image edge (typically because the window is huge or
+/// retina-large), the helper falls back to a downscaled image with a
+/// reported scale < 1; we tell the agent to divide in that case.
+function buildCoordsLine(capture: CurrentCapture): string {
+	const winW = Math.round(capture.windowWidth);
+	const winH = Math.round(capture.windowHeight);
+	const imgW = capture.width;
+	const imgH = capture.height;
+	const scale = capture.scaleFactor || 1;
+	const normalized = Math.abs(scale - 1) < 0.05;
+	if (normalized) {
+		return `\n\nCoords: window ${winW}x${winH} pts | image ${imgW}x${imgH} px (1:1). Click/move/drag/scroll x,y are the pixel coords you read off the image — they're identical to window logical points in [0..${winW}, 0..${winH}]. No scale math.`;
+	}
+	// Fallback: window logical size exceeded the max image edge cap; the
+	// helper downscaled to fit. Pixel coords from the image are NOT 1:1.
+	return `\n\nCoords: window ${winW}x${winH} pts | image ${imgW}x${imgH} px | scale ${scale.toFixed(2)}. Window logical size exceeded the image edge cap; click/move/drag/scroll x,y are still in window LOGICAL POINTS [0..${winW}, 0..${winH}]. If you read a pixel off the image, divide by scale.`;
 }
 
 function formatAppLine(app: ListAppsDetails["apps"][number]): string {
@@ -2403,15 +2424,15 @@ async function buildToolResult(
 	// marker would be noise; screenshot is the natural "start of
 	// inspection" moment, mirroring how we ship app instructions there.
 	const markerText = tool === "screenshot" ? `[${formatModeMarker()}]\n` : "";
-	// Coordinate-units reminder. Bolt this onto every screenshot so the
-	// model can't read it once and forget. Names the trap explicitly:
-	// the image is captured at retina backing scale (typically 2x), but
-	// click/move/drag/scroll coordinates are window-relative LOGICAL
-	// POINTS in [0..windowWidth] x [0..windowHeight]. Without this line
-	// models routinely read pixel coords off the image and silently
-	// miss by ~2x.
+	// Coordinate-units reminder. Screenshots are normalized to logical-
+	// point resolution by default (1 image px == 1 window logical pt),
+	// so coords the agent reads off the image ARE the coords to pass to
+	// click/move/drag/scroll. Without this line models still occasionally
+	// reach for division by some "retina factor"; this kills the impulse.
+	// When window logical size exceeds the per-edge cap, the image gets
+	// downscaled and scale falls below 1; the line below adapts.
 	const coordsLine = tool === "screenshot"
-		? `\n\nCoords: window ${Math.round(result.capture.windowWidth)}x${Math.round(result.capture.windowHeight)} pts | image ${result.capture.width}x${result.capture.height} px | scale ${(result.capture.scaleFactor || 1).toFixed(2)}. Click/move/drag/scroll x,y are LOGICAL POINTS in [0..${Math.round(result.capture.windowWidth)}, 0..${Math.round(result.capture.windowHeight)}]. The image has logical-pt RULER TICKS along the top and left edges (major every 50, minor every 25) - read the labels directly to get x,y; no scale math required.`
+		? buildCoordsLine(result.capture)
 		: "";
 	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${markerText}${summary}${coordsLine}${axTargetText}${fallbackText}${appInstructionsText}` }];
 	if (fallbackReason) {

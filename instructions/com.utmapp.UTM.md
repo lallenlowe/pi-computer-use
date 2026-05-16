@@ -9,7 +9,7 @@ Know which surface you're on before clicking.
 
 ## VM management chrome
 
-Standard rules. Use AX refs when listed. SwiftUI checkboxes in wizard sheets often don't surface as AX targets — coord-click those. Envelope `scale` (~2.0 on retina) is correct: divide image-pixel measurements by `scale` to get logical points. Confirmed coord-only: "Use Apple Virtualization", "Boot from kernel image", "Enable Rosetta".
+Standard rules. Use AX refs when listed. SwiftUI checkboxes in wizard sheets often don't surface as AX targets — coord-click those, reading pixel coords directly off the normalized screenshot. Confirmed coord-only: "Use Apple Virtualization", "Boot from kernel image", "Enable Rosetta".
 
 ## VM display window
 
@@ -21,9 +21,9 @@ When the toolbar `AXCheckBox "Capture Input"` is **off**, clicks stay in macOS c
 - `click({ ref })` on Capture Input is unreliable (AXPress no-ops). Use `apple_script` `click checkbox "Capture Input" of …`, then re-verify.
 - **`surface_window` silently turns Capture Input off.** Re-verify and re-enable every time you raise the VM window.
 
-### Coordinate scale & misses
+### Coordinate misses
 
-Envelope `scale` IS correct. **A miss is almost always Capture Input being off, not a scale mismatch — don't keep adjusting scale, re-check Capture Input first.** Verify scale once by clicking a known sharp-edge target (close-X, button corner).
+Screenshots are 1:1 with logical points; the coords you read off the image ARE the coords to pass. **A miss is almost always Capture Input being off or UTM not frontmost — re-check those first** before suspecting coords.
 
 ### Guest AX is unreachable
 
