@@ -4273,7 +4273,7 @@ final class Bridge {
 
 	private func modifierFlag(_ key: String) -> CGEventFlags? {
 		switch key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-		case "cmd", "command", "meta":
+		case "cmd", "command", "meta", "super", "win", "windows":
 			return .maskCommand
 		case "ctrl", "control":
 			return .maskControl
@@ -4305,7 +4305,61 @@ final class Bridge {
 			"down": 125, "arrowdown": 125, "arrow_down": 125,
 			"up": 126, "arrowup": 126, "arrow_up": 126,
 		]
-		return table[normalized]
+		if let code = table[normalized] {
+			return code
+		}
+		// Standalone modifier keys. These also appear in modifierFlag
+		// for chord delivery ("Command+L") - this path is for the
+		// keypress-as-tap case (open GNOME activities with Super,
+		// invoke macOS Spotlight via a Command-only rebind, etc).
+		// Super/Meta/Win all alias to the left Command key on macOS,
+		// matching the cross-platform convention that calls the OS-
+		// modifier 'Super' on Linux and 'Meta' in keyboard event APIs.
+		return modifierKeyCode(normalized)
+	}
+
+	/// Map a modifier name to the virtual key code of its left-side
+	/// physical key. Used by postKey to deliver standalone-modifier
+	/// taps (Command alone, Super alone, Shift alone). Returns nil for
+	/// non-modifier names.
+	private func modifierKeyCode(_ name: String) -> CGKeyCode? {
+		switch name {
+		case "command", "cmd", "super", "meta", "win", "windows", "lcommand", "leftcommand", "left_command":
+			return 55
+		case "rcommand", "rightcommand", "right_command":
+			return 54
+		case "shift", "lshift", "leftshift", "left_shift":
+			return 56
+		case "rshift", "rightshift", "right_shift":
+			return 60
+		case "option", "alt", "loption", "leftoption", "left_option", "lalt", "leftalt", "left_alt":
+			return 58
+		case "roption", "rightoption", "right_option", "ralt", "rightalt", "right_alt":
+			return 61
+		case "control", "ctrl", "lcontrol", "leftcontrol", "left_control", "lctrl", "leftctrl", "left_ctrl":
+			return 59
+		case "rcontrol", "rightcontrol", "right_control", "rctrl", "rightctrl", "right_ctrl":
+			return 62
+		case "fn", "function":
+			return 63
+		default:
+			return nil
+		}
+	}
+
+	/// Modifier-flag bit corresponding to a modifier virtual key. Used
+	/// by postKey to set the right CGEventFlags bit during a standalone
+	/// modifier tap so the OS sees a real modifier transition (not just
+	/// a bare keyDown of an unflagged virtual key).
+	private func modifierFlagForKeyCode(_ code: CGKeyCode) -> CGEventFlags? {
+		switch code {
+		case 54, 55: return .maskCommand
+		case 56, 60: return .maskShift
+		case 58, 61: return .maskAlternate
+		case 59, 62: return .maskControl
+		case 63: return .maskSecondaryFn
+		default: return nil
+		}
 	}
 
 	private func keyChord(_ keys: [String]) -> (flags: CGEventFlags, key: String)? {
@@ -4347,6 +4401,22 @@ final class Bridge {
 			}
 			throw BridgeFailure(message: "Unsupported key '\(key)'", code: "invalid_args")
 		}
+
+		// Standalone modifier taps (Command alone, Super alone, Shift
+		// alone) need a different event shape: macOS represents modifier
+		// transitions as kCGEventFlagsChanged events, NOT keyDown/keyUp.
+		// Apps that listen via NSEvent.flagsChanged or via a CGEventTap
+		// subscribed to the flagsChanged mask (UTM, Parallels, GNOME's
+		// remote input handler, etc) ignore keyDown of modifier virtual
+		// keys - they only act on the flag transition. Posting keyDown
+		// works for Cocoa apps that hit-test the virtual key directly,
+		// but the canonical shape that everything respects is
+		// flagsChanged with the modifier bit toggled.
+		if let modFlag = modifierFlagForKeyCode(code) {
+			try postModifierTap(virtualKey: code, modifierFlag: modFlag, baseFlags: flags, pid: pid)
+			return
+		}
+
 		guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
 			let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
 		else {
@@ -4354,6 +4424,33 @@ final class Bridge {
 		}
 		down.flags = flags
 		up.flags = flags
+		postEvent(down, pid: pid)
+		usleep(8_000)
+		postEvent(up, pid: pid)
+	}
+
+	/// Synthesize a press-and-release of a standalone modifier key
+	/// (Command alone, Super alone, Shift alone). Two CGEvents of type
+	/// kCGEventFlagsChanged, one with the modifier bit set, one with it
+	/// cleared - this is the shape that macOS itself produces when the
+	/// user taps a physical modifier, and the only shape that flag-tap
+	/// listeners (UTM/Parallels guest input, GNOME activities trigger,
+	/// CGEventTap subscribers on flagsChanged) react to.
+	private func postModifierTap(virtualKey: CGKeyCode, modifierFlag: CGEventFlags, baseFlags: CGEventFlags, pid: Int32) throws {
+		guard let down = CGEvent(source: nil) else {
+			throw BridgeFailure(message: "Failed to create modifier event", code: "input_failed")
+		}
+		down.type = .flagsChanged
+		down.setIntegerValueField(.keyboardEventKeycode, value: Int64(virtualKey))
+		down.flags = baseFlags.union(modifierFlag)
+
+		guard let up = CGEvent(source: nil) else {
+			throw BridgeFailure(message: "Failed to create modifier event", code: "input_failed")
+		}
+		up.type = .flagsChanged
+		up.setIntegerValueField(.keyboardEventKeycode, value: Int64(virtualKey))
+		up.flags = baseFlags
+
 		postEvent(down, pid: pid)
 		usleep(8_000)
 		postEvent(up, pid: pid)
