@@ -2213,6 +2213,15 @@ final class Bridge {
 		payload["focused"] = (setStatus == .success)
 		if setStatus != .success {
 			payload["reason"] = "focus_failed"
+		} else {
+			// Slice 20: keep the overlay cursor honest. The other AX
+			// element-targeted commands (axPress, axSetValue, axScroll*)
+			// all call syncOverlayToElement on success so the cursor
+			// animates to the affected element. Without this, Cmd+L's
+			// browser-address-field focus path moved focus invisibly
+			// and the next type_text appeared to come from nowhere.
+			let ownerPid = optionalIntArg(request, "pid").map { pid_t($0) }
+			syncOverlayToElement(element, ownerPid: ownerPid)
 		}
 		return payload
 	}
