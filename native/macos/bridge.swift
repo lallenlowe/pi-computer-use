@@ -128,6 +128,34 @@ struct KeypressBadgeEffect {
 	}
 }
 
+/// One "agent scrolled here" effect. Anchored at the scroll point
+/// (cursor location at the moment scrollWheel was posted) with a
+/// direction vector encoded as a unit-ish (dx, dy). Magnitude is
+/// implicit — the controller derives chevron count from the raw
+/// delta passed at trigger time so a small scroll renders a single
+/// chevron and a large scroll fans out a few stacked ones.
+///
+/// Color is teal-green per the documented agent action color
+/// language (scroll = teal-green, keyboard = sky-blue, mouse =
+/// button-color, focus/window = amber).
+struct ScrollEffect {
+	let id: UUID
+	let globalPoint: CGPoint
+	/// Direction component along x (positive = right). Normalized to
+	/// the unit vector at construction time.
+	let dx: CGFloat
+	/// Direction component along y (positive = down in CG global coords).
+	let dy: CGFloat
+	/// Number of chevrons to stamp (1–3). Driven by scroll magnitude.
+	let chevronCount: Int
+	let startTime: CFTimeInterval
+	static let duration: CFTimeInterval = 0.420
+
+	func isFinished(at now: CFTimeInterval) -> Bool {
+		return now - startTime >= ScrollEffect.duration
+	}
+}
+
 /// Pre-converted, per-screen-local effect descriptors that the view
 /// renders on each draw. The OverlayController owns effects in global
 /// CG coords and walks them per-screen at render time, mirroring how
@@ -149,6 +177,14 @@ struct ScreenLocalKeypressBadge {
 	let age: CFTimeInterval
 }
 
+struct ScreenLocalScrollEffect {
+	let localPoint: CGPoint
+	let dx: CGFloat
+	let dy: CGFloat
+	let chevronCount: Int
+	let age: CFTimeInterval
+}
+
 /// Custom NSView that paints the agent's virtual cursor at the
 /// configured screen-local point. Renders a paper-airplane shape
 /// translated from `assets/cursor.svg` (600x600 viewBox) into native
@@ -165,6 +201,7 @@ final class OverlayCursorView: NSView {
 	var clickRings: [ScreenLocalClickRing] = []
 	var typeFlashes: [ScreenLocalTypeFlash] = []
 	var keypressBadges: [ScreenLocalKeypressBadge] = []
+	var scrollEffects: [ScreenLocalScrollEffect] = []
 
 	// SVG viewBox dims and the in-viewBox coords of the click hotspot.
 	// Kept as named constants so the path-translation math reads
@@ -183,6 +220,7 @@ final class OverlayCursorView: NSView {
 		// occluded by the very thing it's announcing.
 		drawTypeFlashes(ctx)
 		drawClickRings(ctx)
+		drawScrollEffects(ctx)
 		drawKeypressBadges(ctx)
 
 		guard let point = cursorPoint else { return }
@@ -296,6 +334,68 @@ final class OverlayCursorView: NSView {
 			NSColor(calibratedRed: 0.247, green: 0.710, blue: 0.984, alpha: alpha * 0.95).setStroke()
 			path.lineWidth = 2.0
 			path.stroke()
+		}
+	}
+
+	/// Render every currently-active scroll effect as a stack of
+	/// stroked chevrons pointing in the scroll direction. Chevrons
+	/// translate outward from the anchor point along the scroll
+	/// vector and fade as they age — the visual reads as "motion
+	/// happened here, this way." Teal-green per the action color
+	/// language (scroll). Magnitude bumps the count from 1 to 3.
+	private func drawScrollEffects(_ ctx: CGContext) {
+		for effect in scrollEffects {
+			let t = max(0.0, min(1.0, effect.age / ScrollEffect.duration))
+			let eased = OverlayController.easeOutCubic(t)
+			// Alpha: hold near full for the first 30%, fade out across
+			// the remaining 70%. Keeps the cue legible even on a quick
+			// scroll.
+			let alpha: CGFloat
+			if t < 0.30 {
+				alpha = 1.0
+			} else {
+				alpha = CGFloat((1.0 - t) / 0.70)
+			}
+			if alpha <= 0 { continue }
+
+			let chevronSize: CGFloat = 14
+			let travel: CGFloat = chevronSize * 1.8
+			// Stack chevrons along the scroll direction. First chevron
+			// is closest to the anchor; subsequent ones lag behind.
+			let color = NSColor(calibratedRed: 0.196, green: 0.804, blue: 0.604, alpha: alpha)
+			color.setStroke()
+
+			for i in 0..<max(1, effect.chevronCount) {
+				let stagger = CGFloat(i) * 0.18
+				let localT = max(0.0, min(1.0, eased - stagger))
+				let offset = travel * localT + CGFloat(i) * chevronSize * 0.9
+				let centerX = effect.localPoint.x + effect.dx * offset
+				let centerY = effect.localPoint.y + effect.dy * offset
+
+				// Chevron geometry: V shape pointing in (dx, dy). Two
+				// strokes meeting at the tip. Tip lies on (centerX, centerY)
+				// along the travel vector; tails fan out perpendicular.
+				let halfWidth: CGFloat = chevronSize * 0.55
+				let tipExtension: CGFloat = chevronSize * 0.45
+				// Perpendicular vector (rotate scroll dir 90°).
+				let perpX = -effect.dy
+				let perpY = effect.dx
+				let tipX = centerX + effect.dx * tipExtension
+				let tipY = centerY + effect.dy * tipExtension
+				let leftX = centerX - effect.dx * tipExtension + perpX * halfWidth
+				let leftY = centerY - effect.dy * tipExtension + perpY * halfWidth
+				let rightX = centerX - effect.dx * tipExtension - perpX * halfWidth
+				let rightY = centerY - effect.dy * tipExtension - perpY * halfWidth
+
+				let path = NSBezierPath()
+				path.move(to: NSPoint(x: leftX, y: leftY))
+				path.line(to: NSPoint(x: tipX, y: tipY))
+				path.line(to: NSPoint(x: rightX, y: rightY))
+				path.lineWidth = 2.5
+				path.lineCapStyle = .round
+				path.lineJoinStyle = .round
+				path.stroke()
+			}
 		}
 	}
 
@@ -489,6 +589,7 @@ final class OverlayController {
 	private var clickRings: [ClickRingEffect] = []
 	private var typeFlashes: [TypeFlashEffect] = []
 	private var keypressBadges: [KeypressBadgeEffect] = []
+	private var scrollEffects: [ScrollEffect] = []
 	private var displayTimer: Timer? = nil
 	private var screenChangeObserver: NSObjectProtocol? = nil
 
@@ -540,6 +641,7 @@ final class OverlayController {
 		clickRings.removeAll()
 		typeFlashes.removeAll()
 		keypressBadges.removeAll()
+		scrollEffects.removeAll()
 		currentDisplayedGlobalPoint = nil
 		if let observer = screenChangeObserver {
 			NotificationCenter.default.removeObserver(observer)
@@ -567,15 +669,28 @@ final class OverlayController {
 	/// `ownerPid` is the PID of the app the agent is acting on; passing
 	/// it lets the occlusion check suppress rendering when the user
 	/// brings a different window to the foreground.
-	func moveTo(globalPoint: CGPoint, ownerPid: pid_t? = nil) {
+	///
+	/// `instant` short-circuits the tween and snaps the overlay to
+	/// the new point. Used by the drag path where waypoints arrive
+	/// every ~8–12ms — way faster than the default 180ms tween, so a
+	/// tweened follow would lag visibly behind the real cursor. Click,
+	/// move_mouse, and AX paths keep the default tweened behaviour.
+	func moveTo(globalPoint: CGPoint, ownerPid: pid_t? = nil, instant: Bool = false) {
 		lastGlobalPoint = globalPoint
 		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
 		if !enabled { return }
 
-		// If we have no prior position or animation is off, just snap.
-		guard animationStyle != .off, let from = currentDisplayedGlobalPoint else {
+		// If we have no prior position, animation is off, or caller
+		// asked for an instant snap (drag waypoints), just snap. The
+		// drag handler holds the AppKit main thread inside a tight
+		// usleep loop, so without a synchronous redraw the run loop
+		// never gets a chance to paint between waypoints and the user
+		// only sees the cursor jump to the last position. Force a
+		// synchronous `view.display()` in the instant path so each
+		// waypoint actually renders before the next CGEvent post.
+		guard !instant, animationStyle != .off, let from = currentDisplayedGlobalPoint else {
 			cancelAnimation()
-			renderGlobalPoint(globalPoint)
+			renderGlobalPoint(globalPoint, forceSynchronousDisplay: instant)
 			currentDisplayedGlobalPoint = globalPoint
 			return
 		}
@@ -681,6 +796,53 @@ final class OverlayController {
 		ensureDisplayTimer()
 	}
 
+	/// Trigger a scroll-effect at the given anchor with the raw
+	/// scroll deltas. Deltas are converted to a unit direction vector
+	/// internally; magnitude is mapped to a chevron count (1–3) so
+	/// small scrolls show one chevron and big bursts show a stack.
+	/// No-op when the overlay is off or both deltas are zero.
+	func triggerScrollEffect(globalPoint: CGPoint, deltaX: Int, deltaY: Int, ownerPid: pid_t? = nil) {
+		if let ownerPid = ownerPid { lastTargetPid = ownerPid }
+		if !enabled { return }
+		if deltaX == 0 && deltaY == 0 { return }
+
+		// Agent convention from the scroll tool docstring: positive
+		// scrollY = scroll DOWN, negative = scroll UP.
+		//
+		// Chevrons are drawn in AppKit *view* coordinates (origin
+		// bottom-left, +y up) because the view is not flipped.
+		// convertGlobalToScreenLocal already flips the anchor point
+		// from CG-global to AppKit-view space; here we just need the
+		// direction vector to also be in AppKit terms. So scroll-down
+		// (+150) -> chevrons should point downward on screen -> negative
+		// y in AppKit view space. Hence the sign inversion.
+		let vx = CGFloat(deltaX)
+		let vy = CGFloat(-deltaY)
+		let magnitude = sqrt(vx * vx + vy * vy)
+		if magnitude < 0.5 { return }
+		let ux = vx / magnitude
+		let uy = vy / magnitude
+
+		// Chevron count: 1 for tiny scrolls, 2 for medium, 3 for big.
+		// Thresholds picked from observation - mouse wheel one notch
+		// is usually deltaY = 8–20 in our scrollWheel calls.
+		let chevrons: Int
+		if magnitude >= 80 { chevrons = 3 }
+		else if magnitude >= 25 { chevrons = 2 }
+		else { chevrons = 1 }
+
+		let now = CACurrentMediaTime()
+		scrollEffects.append(ScrollEffect(
+			id: UUID(),
+			globalPoint: globalPoint,
+			dx: ux,
+			dy: uy,
+			chevronCount: chevrons,
+			startTime: now
+		))
+		ensureDisplayTimer()
+	}
+
 	private func ensureDisplayTimer() {
 		if displayTimer != nil { return }
 		// 60Hz tick. Timer on the main run loop is good enough for a
@@ -707,7 +869,7 @@ final class OverlayController {
 	}
 
 	private func hasActiveEffects() -> Bool {
-		return !clickRings.isEmpty || !typeFlashes.isEmpty || !keypressBadges.isEmpty
+		return !clickRings.isEmpty || !typeFlashes.isEmpty || !keypressBadges.isEmpty || !scrollEffects.isEmpty
 	}
 
 	private func tick() {
@@ -725,6 +887,7 @@ final class OverlayController {
 		clickRings.removeAll { $0.isFinished(at: now) }
 		typeFlashes.removeAll { $0.isFinished(at: now) }
 		keypressBadges.removeAll { $0.isFinished(at: now) }
+		scrollEffects.removeAll { $0.isFinished(at: now) }
 
 		// Repaint with whatever cursor + effects are current.
 		let pointToRender = currentDisplayedGlobalPoint ?? lastGlobalPoint
@@ -744,7 +907,7 @@ final class OverlayController {
 	/// per-screen overlay windows, plus any active effects projected
 	/// into screen-local coords. No state change - callers update
 	/// `currentDisplayedGlobalPoint` themselves.
-	private func renderGlobalPoint(_ globalPoint: CGPoint, now: CFTimeInterval = CACurrentMediaTime()) {
+	private func renderGlobalPoint(_ globalPoint: CGPoint, now: CFTimeInterval = CACurrentMediaTime(), forceSynchronousDisplay: Bool = false) {
 		// Occlusion check: if the topmost real window under the cursor
 		// doesn't belong to the agent's target PID, suppress everything
 		// (cursor + effects) so the overlay never appears in front of an
@@ -760,6 +923,7 @@ final class OverlayController {
 				view.clickRings = []
 				view.typeFlashes = []
 				view.keypressBadges = []
+				view.scrollEffects = []
 				view.needsDisplay = true
 				continue
 			}
@@ -792,7 +956,26 @@ final class OverlayController {
 				let local = convertGlobalToScreenLocal(badge.globalPoint, screen: screen)
 				return ScreenLocalKeypressBadge(localPoint: local, label: badge.label, age: now - badge.startTime)
 			}
-			view.needsDisplay = true
+			view.scrollEffects = scrollEffects.map { effect in
+				let local = convertGlobalToScreenLocal(effect.globalPoint, screen: screen)
+				return ScreenLocalScrollEffect(localPoint: local, dx: effect.dx, dy: effect.dy, chevronCount: effect.chevronCount, age: now - effect.startTime)
+			}
+			if forceSynchronousDisplay {
+				// Synchronous redraw — used by the drag waypoint path
+				// where the main thread is held in a tight usleep loop
+				// and the AppKit run loop can't otherwise pump frames.
+				// display() repaints the view; the wrapping CATransaction
+				// begin/commit forces the layer contents to flush to the
+				// WindowServer right now rather than waiting for the
+				// next run-loop tick that we're actively blocking.
+				CATransaction.begin()
+				CATransaction.setDisableActions(true)
+				view.display()
+				CATransaction.commit()
+				CATransaction.flush()
+			} else {
+				view.needsDisplay = true
+			}
 		}
 	}
 
@@ -805,6 +988,7 @@ final class OverlayController {
 		let anchor: CGPoint? = clickRings.first.map { $0.globalPoint }
 			?? typeFlashes.compactMap { $0.globalRect.map { CGPoint(x: $0.midX, y: $0.midY) } }.first
 			?? keypressBadges.first.map { $0.globalPoint }
+			?? scrollEffects.first.map { $0.globalPoint }
 		let shouldRender = anchor.map { shouldRenderForCurrentTarget(at: $0) } ?? true
 
 		for (index, window) in windows.enumerated() {
@@ -815,6 +999,7 @@ final class OverlayController {
 				view.clickRings = []
 				view.typeFlashes = []
 				view.keypressBadges = []
+				view.scrollEffects = []
 				view.needsDisplay = true
 				continue
 			}
@@ -829,6 +1014,10 @@ final class OverlayController {
 			view.keypressBadges = keypressBadges.map { badge in
 				let local = convertGlobalToScreenLocal(badge.globalPoint, screen: screen)
 				return ScreenLocalKeypressBadge(localPoint: local, label: badge.label, age: now - badge.startTime)
+			}
+			view.scrollEffects = scrollEffects.map { effect in
+				let local = convertGlobalToScreenLocal(effect.globalPoint, screen: screen)
+				return ScreenLocalScrollEffect(localPoint: local, dx: effect.dx, dy: effect.dy, chevronCount: effect.chevronCount, age: now - effect.startTime)
 			}
 			view.needsDisplay = true
 		}
@@ -1195,6 +1384,14 @@ final class Bridge {
 				point = CGPoint(x: x, y: y)
 			}
 			OverlayController.shared.triggerKeypressBadge(label: label, globalPoint: point, ownerPid: pid)
+			return ["triggered": OverlayController.shared.isEnabled()]
+		case "overlayScrollEffect":
+			let x = try doubleArg(request, "x")
+			let y = try doubleArg(request, "y")
+			let dx = optionalIntArg(request, "deltaX") ?? 0
+			let dy = optionalIntArg(request, "deltaY") ?? 0
+			let pid = optionalIntArg(request, "pid").map { pid_t($0) }
+			OverlayController.shared.triggerScrollEffect(globalPoint: CGPoint(x: x, y: y), deltaX: dx, deltaY: dy, ownerPid: pid)
 			return ["triggered": OverlayController.shared.isEnabled()]
 		case "overlayConfigure":
 			if let style = optionalStringArg(request, "style") {
@@ -2317,7 +2514,14 @@ final class Bridge {
 			return ["scrolled": false, "reason": "element_ref_invalid"]
 		}
 		syncOverlayToElement(element, ownerPid: targetPid)
-		return performScrollActionOrAncestor(startingAt: element, targetPid: targetPid, scrollX: optionalIntArg(request, "scrollX") ?? 0, scrollY: optionalIntArg(request, "scrollY") ?? 0, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
+		let scrollX = optionalIntArg(request, "scrollX") ?? 0
+		let scrollY = optionalIntArg(request, "scrollY") ?? 0
+		// Anchor the chevrons on the element midpoint when AX has a
+		// frame; the controller falls back to lastGlobalPoint otherwise.
+		if let frame = frameForElement(element) {
+			OverlayController.shared.triggerScrollEffect(globalPoint: CGPoint(x: frame.midX, y: frame.midY), deltaX: scrollX, deltaY: scrollY, ownerPid: targetPid)
+		}
+		return performScrollActionOrAncestor(startingAt: element, targetPid: targetPid, scrollX: scrollX, scrollY: scrollY, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
 	}
 
 	private func axScrollAtPoint(_ request: [String: Any]) throws -> [String: Any] {
@@ -2331,10 +2535,13 @@ final class Bridge {
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
 		OverlayController.shared.moveTo(globalPoint: point, ownerPid: targetPid)
+		let scrollX = optionalIntArg(request, "scrollX") ?? 0
+		let scrollY = optionalIntArg(request, "scrollY") ?? 0
+		OverlayController.shared.triggerScrollEffect(globalPoint: point, deltaX: scrollX, deltaY: scrollY, ownerPid: targetPid)
 		guard let hitElement = hitTestElement(at: point) else {
 			return ["scrolled": false, "reason": "hit_test_failed"]
 		}
-		return performScrollActionOrAncestor(startingAt: hitElement, targetPid: targetPid, scrollX: optionalIntArg(request, "scrollX") ?? 0, scrollY: optionalIntArg(request, "scrollY") ?? 0, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
+		return performScrollActionOrAncestor(startingAt: hitElement, targetPid: targetPid, scrollX: scrollX, scrollY: scrollY, steps: max(1, min(8, optionalIntArg(request, "steps") ?? 1)))
 	}
 
 	/// Move the overlay cursor to the visual center of an AX element if
@@ -3511,6 +3718,13 @@ final class Bridge {
 				throw BridgeFailure(message: "Failed to create mouse drag event", code: "input_failed")
 			}
 			postEvent(drag, pid: pid)
+			// Sync overlay to each waypoint as the drag progresses.
+			// instant: true bypasses the 180ms tween — with waypoints
+			// arriving every 8ms a tweened follow would lag visibly
+			// behind the real cursor. The overlay's per-frame render is
+			// still rate-limited to 60Hz so we don't redraw on every
+			// waypoint, just keep the last sample fresh.
+			OverlayController.shared.moveTo(globalPoint: point, ownerPid: pid, instant: true)
 			usleep(8_000)
 		}
 
@@ -3524,6 +3738,16 @@ final class Bridge {
 
 	private func postScrollWheel(at point: CGPoint, deltaX: Int, deltaY: Int, pid: Int32) throws {
 		try postMouseMove(to: point, pid: pid)
+		// Visual: announce the scroll direction + magnitude before
+		// posting the event so the user sees the chevrons fan out as
+		// the scroll happens. Magnitude→chevron-count mapping lives
+		// in OverlayController.triggerScrollEffect.
+		OverlayController.shared.triggerScrollEffect(
+			globalPoint: point,
+			deltaX: deltaX,
+			deltaY: deltaY,
+			ownerPid: pid
+		)
 		guard let event = CGEvent(
 			scrollWheelEvent2Source: nil,
 			units: .pixel,
