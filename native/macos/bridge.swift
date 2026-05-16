@@ -2428,6 +2428,7 @@ final class Bridge {
 		let button = mouseButton(optionalStringArg(request, "button") ?? "left")
 		let clickCount = max(1, min(3, optionalIntArg(request, "clickCount") ?? 1))
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
+		ensureFrontmostForOpaqueFramebuffer(pid: targetPid, windowId: windowId)
 		try postMouseClick(at: point, pid: targetPid, button: button, clickCount: clickCount)
 		return ["clicked": true]
 	}
@@ -2442,6 +2443,7 @@ final class Bridge {
 		let captureWidth = max(1.0, (try? doubleArg(request, "captureWidth")) ?? 1.0)
 		let captureHeight = max(1.0, (try? doubleArg(request, "captureHeight")) ?? 1.0)
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
+		ensureFrontmostForOpaqueFramebuffer(pid: targetPid, windowId: windowId)
 		try postMouseMove(to: point, pid: targetPid)
 		return ["moved": true]
 	}
@@ -2465,6 +2467,7 @@ final class Bridge {
 			}
 			return try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: frame)
 		}
+		ensureFrontmostForOpaqueFramebuffer(pid: targetPid, windowId: windowId)
 		try postMouseDrag(points: points, pid: targetPid)
 		return ["dragged": true]
 	}
@@ -2481,6 +2484,7 @@ final class Bridge {
 		let scrollX = optionalIntArg(request, "scrollX") ?? 0
 		let scrollY = optionalIntArg(request, "scrollY") ?? 0
 		let point = try mapWindowPoint(windowId: windowId, x: x, y: y, captureWidth: captureWidth, captureHeight: captureHeight, windowFrame: windowFrameArg(request))
+		ensureFrontmostForOpaqueFramebuffer(pid: targetPid, windowId: windowId)
 		try postScrollWheel(at: point, deltaX: scrollX, deltaY: scrollY, pid: targetPid)
 		return ["scrolled": true]
 	}
@@ -2492,6 +2496,7 @@ final class Bridge {
 		guard let keys = request["keys"] as? [String], !keys.isEmpty else {
 			throw BridgeFailure(message: "keyPress requires at least one key", code: "invalid_args")
 		}
+		ensureFrontmostForOpaqueFramebuffer(pid: targetPid, windowId: nil)
 		try postKeyPress(keys: keys, pid: targetPid)
 		// Visual: announce the key the agent just pressed via a small
 		// pill near the focused element (preferred) or near the cursor
@@ -4144,21 +4149,88 @@ final class Bridge {
 	///
 	/// We default to postToPid because it preserves the stealth
 	/// contract (input ops never steal focus, never bleed onto non-
-	/// target apps). But when the target app is **already frontmost**,
-	/// stealth is moot — the user has the app active anyway — and we
-	/// upgrade to cghidEventTap to unlock the HID-grabbing apps. The
-	/// caller's postMouseMove already parked the system cursor at the
-	/// event location, so HID routing lands on the right window.
+	/// target apps). Two upgrade conditions trigger cghidEventTap:
+	///
+	///   - **Target is frontmost.** Stealth is moot, and HID routing
+	///     unlocks HID-grabbing apps (web compositors, games, etc).
+	///   - **Target is an opaque-framebuffer app** (UTM, Parallels, etc).
+	///     The mac-side process forwards input to its guest via an
+	///     internal pipe that only ingests events from the system input
+	///     pipeline. postToPid drops the event into the host process's
+	///     event queue — the AppKit chrome sees it, but the host→guest
+	///     forwarder doesn't. cghidEventTap reaches the forwarder. We
+	///     pay the focus-stealth cost (cursor parks at the event
+	///     location, just like a real mouse) but the click actually
+	///     lands in the guest.
+	///
+	/// The caller's postMouseMove already parked the system cursor at
+	/// the event location, so HID routing lands on the right window.
 	///
 	/// scrollWheel events bypass this helper entirely and always go
 	/// through cghidEventTap (see postScrollWheel) because postToPid
 	/// silently no-ops for scroll across the board, frontmost or not.
 	private func postEvent(_ event: CGEvent, pid: Int32) {
-		if isFrontmost(pid: pid) {
+		if isFrontmost(pid: pid) || isOpaqueFramebufferApp(pid: pid) {
 			event.post(tap: .cghidEventTap)
 		} else {
 			event.postToPid(pid)
 		}
+	}
+
+	/// Bring an opaque-framebuffer app's window forward so HID-tap
+	/// clicks at the cursor location land in IT, not whatever app's
+	/// window happens to be on top of the click coordinate.
+	///
+	/// HID-tap delivery follows the global window stack: the click goes
+	/// to the topmost window at the cursor's screen position. For VMs
+	/// like UTM, the host process forwards input to the guest only via
+	/// HID-tap (postToPid drops at the host->guest boundary), so we MUST
+	/// use HID-tap. But if the VM window is behind, say, the user's
+	/// terminal, our click hits the terminal instead.
+	///
+	/// Calling this before input dispatch activates the app and raises
+	/// the target window so the HID-tap lands correctly. It's a real
+	/// focus change — the user will see their frontmost app jump to the
+	/// VM. For opaque-framebuffer apps the stealth contract was already
+	/// moot (the agent is going to interact with the guest UI; the user
+	/// can't share input with the VM anyway), so we accept that tradeoff
+	/// here rather than miss every click.
+	///
+	/// No-op when the target is already frontmost, when the target isn't
+	/// an opaque-framebuffer app, or when the windowId can't be located.
+	private func ensureFrontmostForOpaqueFramebuffer(pid: Int32, windowId: UInt32?) {
+		guard isOpaqueFramebufferApp(pid: pid) else { return }
+		guard !isFrontmost(pid: pid) else { return }
+		if let runningApp = NSRunningApplication(processIdentifier: pid) {
+			runningApp.activate(options: [])
+		}
+		if let windowId, let axWindow = axWindowForCGWindow(windowId: windowId, pid: pid) {
+			AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+		}
+		// Small settle window for the window-server to commit the new
+		// frontmost + window stack before we post events.
+		usleep(60_000)
+	}
+
+	/// Look up the AXUIElement for a given CGWindowID owned by `pid`.
+	/// Walks the app's AX window list and matches against CGWindowList
+	/// candidates by frame + title — same approach resolveWakeTarget uses.
+	private func axWindowForCGWindow(windowId: UInt32, pid: Int32) -> AXUIElement? {
+		let appElement = AXUIElementCreateApplication(pid)
+		AXUIElementSetMessagingTimeout(appElement, 1.0)
+		let windows = axElementArray(appElement, attribute: kAXWindowsAttribute as CFString)
+		let candidates = cgWindowCandidates(pid: pid)
+		var usedIds = Set<UInt32>()
+		for window in windows {
+			let axTitle = stringAttribute(window, attribute: kAXTitleAttribute as CFString) ?? ""
+			let axFrame = frameForWindow(window)
+			let candidate = bestCandidate(frame: axFrame, title: axTitle, candidates: candidates, usedIds: usedIds)
+			if let candidate { usedIds.insert(candidate.windowId) }
+			if candidate?.windowId == windowId {
+				return window
+			}
+		}
+		return nil
 	}
 
 	/// True when `pid` owns the currently frontmost application. Used
@@ -4167,6 +4239,32 @@ final class Bridge {
 	private func isFrontmost(pid: Int32) -> Bool {
 		guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
 		return frontmost.processIdentifier == pid
+	}
+
+	/// Bundle IDs of apps whose windows are opaque framebuffers
+	/// (VM displays, remote-control viewers). These apps do not surface
+	/// AX targets for guest content, AND their host→guest input pipes
+	/// only ingest cghidEventTap events — postToPid delivery is silently
+	/// dropped at the host→guest boundary even though the mac-side
+	/// AppKit event queue accepts it.
+	///
+	/// Keep in sync with `OPAQUE_FRAMEBUFFER_BUNDLE_IDS` in
+	/// `src/bridge.ts` (which uses the list for a different purpose:
+	/// skipping AX hit-tests in dispatchClick). The two lists overlap
+	/// by definition; if they ever diverge we have a bug somewhere.
+	private static let opaqueFramebufferBundleIds: Set<String> = [
+		"com.utmapp.UTM",
+	]
+
+	/// True when `pid` belongs to an opaque-framebuffer app. Returns
+	/// false when the pid can't be resolved to a bundle ID (e.g. the
+	/// process exited between lookup and check) — we'd rather attempt
+	/// stealth delivery in the uncertain case than surprise-steal focus.
+	private func isOpaqueFramebufferApp(pid: Int32) -> Bool {
+		guard let app = NSRunningApplication(processIdentifier: pid),
+			let bundleId = app.bundleIdentifier
+		else { return false }
+		return Bridge.opaqueFramebufferBundleIds.contains(bundleId)
 	}
 
 	private func postMouseMove(to point: CGPoint, pid: Int32) throws {

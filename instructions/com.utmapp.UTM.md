@@ -21,9 +21,9 @@ When the toolbar `AXCheckBox "Capture Input"` is **off**, clicks stay in macOS c
 - `click({ ref })` on Capture Input is unreliable (AXPress no-ops). Use `apple_script` `click checkbox "Capture Input" of …`, then re-verify.
 - **`surface_window` silently turns Capture Input off.** Re-verify and re-enable every time you raise the VM window.
 
-### Coordinate misses
+### Coord clicks auto-raise UTM (no need to surface_window first)
 
-Screenshots are 1:1 with logical points; the coords you read off the image ARE the coords to pass. **A miss is almost always Capture Input being off or UTM not frontmost — re-check those first** before suspecting coords.
+Coord clicks into UTM activate the app and raise the target window before posting, so the click lands in the guest even when UTM was behind other windows or another app was frontmost. Side effect: macOS frontmost jumps to UTM. That's a visible focus change. Re-verify Capture Input after the click — it may or may not survive the raise; this hasn't been characterized as carefully as `surface_window`'s known drop.
 
 ### Guest AX is unreachable
 

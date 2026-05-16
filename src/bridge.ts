@@ -596,17 +596,24 @@ const BROWSER_BUNDLE_IDS = new Set([
 	"org.mozilla.firefox",
 ]);
 // Apps whose primary content is a framebuffer / opaque render surface
-// macOS AX can't see into. Coordinate clicks on these windows still
-// route correctly via the per-PID + frontmost-HID-tap path, but the
-// hit-test attempts (axPressAtPoint / axFocusAtPoint) waste two
-// helper round-trips before falling through, and flip the result's
-// fallbackUsed flag to true - whichn triggers the 'image attached
-// for recovery' branch on every click, ballooning history. Listing the
-// app here short-circuits the AX hit-test for clicks into its windows.
+// macOS AX can't see into. Listing an app here has two effects:
 //
-// We're deliberately conservative: only apps whose windows are KNOWN
-// opaque go here. Other apps with sparse AX still benefit from the
-// hit-test attempts because some controls do surface.
+//   1. (TS, here) dispatchClick skips the AX hit-test for coordinate
+//      clicks. The hit-test always fails for these and the failure
+//      flips fallbackUsed=true, ballooning history with attached
+//      recovery images on every click.
+//   2. (Swift, native/macos/bridge.swift `opaqueFramebufferBundleIds`)
+//      postEvent always uses cghidEventTap delivery for these apps,
+//      not just when frontmost. The host process forwards input to
+//      its guest via a pipe that only ingests HID-tap events; postToPid
+//      lands in the AppKit chrome but is silently dropped at the
+//      host→guest boundary. Without this the agent has to surface_window
+//      the VM before every click can reach the guest.
+//
+// Keep the two lists in sync. They're deliberately conservative
+// (only apps whose windows are KNOWN opaque go here); other apps with
+// sparse AX still benefit from the hit-test attempts because some
+// controls do surface.
 const OPAQUE_FRAMEBUFFER_BUNDLE_IDS = new Set([
 	"com.utmapp.UTM",
 	// add: parallels, vmware fusion, etc. as they're verified.
